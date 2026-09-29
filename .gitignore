@@ -1,0 +1,23 @@
+# SwiftPM 构建产物
+.build/
+.swiftpm/
+
+# 探针脚本编译出来的可执行文件（源码在 docs/probe/，见该目录 README）
+docs/probe/energy_probe
+docs/probe/uidprobe
+docs/probe/energy_delta
+docs/probe/sum
+docs/probe/power_probe
+docs/probe/perf_probe
+docs/probe/series
+docs/probe/watch
+docs/probe/pid_energy
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器工程目录
+.idea/
+*.xcuserdata/
+xcuserdata/
