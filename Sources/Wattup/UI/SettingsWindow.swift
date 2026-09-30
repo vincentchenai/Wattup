@@ -723,24 +723,42 @@ private struct ChargingPane: View {
                 SettingNote(symbol: "lock.fill", text: hint)
             }
 
-            SettingGroup(title: "充电上限", symbol: "battery.100percent.bolt") {
-                SettingRow(symbol: "battery.100percent.bolt", chip: JB.orange,
-                           title: "限制最高充电电量",
-                           subtitle: "尚未实现 —— 需要写入 SMC，必须由 root helper 完成",
-                           subtitleTint: JB.orange,
-                           isLast: true) {
-                    Text("规划中")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundStyle(JB.orange)
-                        .padding(.horizontal, 8).padding(.vertical, 3)
-                        .background(Capsule().fill(JB.orange.opacity(0.14)))
+            // 这里呈现为**状态**而不是开关：读取系统充电策略不需要任何权限，改写才需要。
+            // 与其摆一个点了没反应的开关，不如把系统真实的策略讲清楚 ——
+            // 「插着电停在 80%」绝大多数情况下就是这个策略在生效，不是故障。
+            let policy = model.chargingPolicy
+            let policyText = model.chargingPolicyText
+
+            SettingGroup(title: "系统充电策略", symbol: "battery.100percent.bolt") {
+                // 用 effectiveSocLimit 而不是 socLimit：被标记结束的策略在记录里
+                // 仍然留着停充点，直接读它会把一条废记录显示成"正在生效的上限"。
+                let limit = policy?.effectiveSocLimit
+                SettingRow(symbol: "battery.100percent.bolt",
+                           chip: policyChipTint(policyText.tone),
+                           title: policyText.title,
+                           subtitle: policyText.detail,
+                           subtitleTint: JB.label,
+                           isLast: limit == nil) {
+                    PolicyBadge(text: policyText.badge, tone: policyText.tone)
+                }
+
+                if let limit {
+                    SettingRow(symbol: "percent", chip: JB.neutral,
+                               title: "停止充电电量",
+                               subtitle: "策略设定的停充位置 —— 插着电停在这里是正常的",
+                               isLast: true) {
+                        Text("\(limit)%")
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(JB.value)
+                            .monospacedDigit()
+                    }
                 }
             }
 
-            SettingNote(symbol: "info.circle.fill",
-                        text: "充电上限归入 P2：需要注册 root daemon + XPC 通信 + SMC 写入，"
-                            + "与低电量模式的一键切换共用同一套特权通道。在拿到这条通道之前"
-                            + "不会做成一个点了没反应的开关。",
+            SettingNote(symbol: "lock.open.fill",
+                        text: "只读呈现。读取系统充电策略不需要任何权限，改写才需要 root ——"
+                            + "所以这里只有状态、没有开关；要改请到系统「电池」里设置。"
+                            + policyAgeSuffix(policy),
                         tint: JB.label)
 
             SettingGroup(title: "系统", symbol: "gearshape.fill") {
@@ -749,7 +767,7 @@ private struct ChargingPane: View {
                 } label: {
                     HStack(spacing: 8) {
                         SettingChip(symbol: "arrow.up.forward.app", color: JB.green)
-                        Text("打开系统「电池」面板")
+                        Text("在系统设置里修改充电上限")
                             .font(.system(size: 12.5, weight: .medium))
                             .foregroundStyle(JB.value)
                         Spacer(minLength: 0)
@@ -763,6 +781,44 @@ private struct ChargingPane: View {
                 .buttonStyle(.plain)
             }
         }
+    }
+
+    private func policyChipTint(_ tone: ChargingPolicyDisplay.Tone) -> Color {
+        switch tone {
+        case .holding: return JB.green
+        case .idle:    return JB.neutral
+        case .unknown: return JB.orange
+        }
+    }
+
+    /// 界面上要标明这是什么时候读的策略 —— 它不会自己刷新，用户得知道看到的有多新。
+    private func policyAgeSuffix(_ policy: ChargingPolicy?) -> String {
+        guard let policy else { return "" }
+        return "（策略读取于 \(Fmt.age(seconds: Int(Date().timeIntervalSince(policy.readAt))))）"
+    }
+}
+
+/// 充电策略的状态徽标。状态色只落在字形与胶囊描边上，不做大块填充。
+private struct PolicyBadge: View {
+    let text: String
+    let tone: ChargingPolicyDisplay.Tone
+
+    private var tint: Color {
+        switch tone {
+        case .holding: return JB.greenText
+        case .idle:    return JB.label
+        case .unknown: return JB.orange
+        }
+    }
+
+    var body: some View {
+        Text(text)
+            .font(.system(size: 10.5, weight: .medium))
+            .foregroundStyle(tint)
+            .fixedSize()
+            .padding(.horizontal, 8).padding(.vertical, 3)
+            .background(Capsule().fill(tint.opacity(0.12)))
+            .overlay(Capsule().strokeBorder(tint.opacity(0.28), lineWidth: 0.5))
     }
 }
 
@@ -916,7 +972,7 @@ private struct AboutPane: View {
             SettingGroup(title: "已知限制", symbol: "exclamationmark.triangle.fill") {
                 AboutLine(symbol: "lock.fill", title: "跨用户进程不可读", detail: "权限边界严格等价于同 uid")
                 AboutLine(symbol: "timer", title: "电量计 60 秒刷新", detail: "界面所有功率值都标注采样时间")
-                AboutLine(symbol: "battery.0percent", title: "充电上限未实现", detail: "需要 root helper 写 SMC")
+                AboutLine(symbol: "battery.0percent", title: "充电策略只读", detail: "能读不能写，改写需要 root")
                 AboutLine(symbol: "envelope.fill", title: "数据不出本机", detail: "无网络请求、无遥测上报", isLast: true)
             }
 

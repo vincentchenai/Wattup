@@ -48,6 +48,7 @@
 | 电池健康状况 | `IOPSCopyPowerSourcesInfo` → `BatteryHealth` | `Good` | 公开 API，非私有字段 |
 | 累计使用时长 | `LifetimeData.TotalOperatingTime` | `3536` min | 58.9 小时 |
 | 应用耗电排行 | `proc_pid_rusage(RUSAGE_INFO_V6).ri_energy_nj` 差分 | 见 §3.5 | 需两次采样求速率 |
+| 系统充电策略 | `/Library/Preferences/com.apple.powerd.charging.plist` 的 `policies` 归档 | `reason=optimizedBatteryCharging`、`soclimit=80` | **只读**，不需要权限；详见 §14 |
 
 ### 功率恒等式（两套独立算法互证）
 
@@ -496,7 +497,8 @@ x-apple.systempreferences:com.apple.Battery-Settings.extension
 
 ### P2 · 需要特权的能力
 
-- 充电上限控制：需要 `SMAppService` 注册的 root daemon + XPC 通信 + SMC 写入
+- 充电上限**控制**：需要 `SMAppService` 注册的 root daemon + XPC 通信 + SMC 写入。
+  （**读取**已实现，见 §14 —— 读这个文件不需要任何权限，别把它一起推到 P2）
 - **低电量模式切换**：`pmset -b lowpowermode` 需要 root。当前实现是"读得到 + 写不进"，
   失败时引导到「电池」设置。要真正一键切换，需要和上一条合用一个 root helper
 - 反向供电监测（`PowerOutDetails`，本机当前未出现该字段，需在给其他设备供电时复测）
@@ -554,7 +556,7 @@ P2 的每项都是独立的风险面，建议单独评估，不要混进 P0/P1�
 
 设计上的两条取舍：
 
-1. **不做点了没反应的开关。** 充电上限需要 root helper 写 SMC，当前只呈现为「规划中」条目并用橙色说明块讲清原因，而不是给一个假开关。
+1. **不做点了没反应的开关。** 充电上限**改写**需要 root helper 写 SMC，所以只呈现为只读状态（策略 / 停止充电电量 / 读取时间）并给出系统面板入口，而不是给一个假开关。「只读」这件事本身不需要任何权限，见 §14。
 2. **状态颜色关闭后的行为写进副标题**（保留中性色，仅在电量极低时变红），因为这是用户唯一能从图标上看出差异的地方。
 
 设置模型 `AppSettings`（`@MainActor`，`static let shared`）直接读写 `UserDefaults`，
@@ -788,6 +790,111 @@ $APP --verify-statusitem              # 锁屏下 → ○ 无法判定 + 静态�
 
 ---
 
+## 14. 系统充电策略：能读，不能写
+
+### 起因
+
+真实提问：「为什么 Mac 充电到 80% 就不再充电了」。答案是 macOS 的**优化电池充电**，
+不是故障。但"知道答案"和"让用户在界面里看到答案"是两件事。
+
+原先设置面板里写的是「充电上限 · 规划中」，理由是**写入需要 root**。
+这个理由对写入成立，对**读取**不成立 —— 于是这条理由把一件本来现在就能做的事推到了 P2。
+
+### 数据源与权限
+
+| 项 | 值 |
+|---|---|
+| 路径 | `/Library/Preferences/com.apple.powerd.charging.plist` |
+| 权限 | `-rw-r--r-- root:wheel` —— root 可写，**全局可读** |
+| 体积 | 690 字节 |
+| `policies` 的值 | 一段 `NSKeyedArchiver` 归档（`Data`），不是普通 plist 字典 |
+
+归档结构（实测 macOS 26.6.2 / Apple M5）：
+
+```text
+$objects[2] = { '$class': UID(6),          # ChargeCtrlPolicy
+                'reason': UID(3),          # → $objects[3]，对象引用
+                'soclimit': 80,            # 内联标量
+                'drain': True, 'noChargeToFull': False,
+                'isEndOfCharge': False, 'terminated': False,
+                'owner': 32214,            # 活进程 pid，两次读数会变
+                'token': UID(4) }
+$objects[3] = 'optimizedBatteryCharging'
+```
+
+### 踩的坑：`NSKeyedUnarchiver` 只解 UID 值
+
+一开始想用 `NSKeyedUnarchiver` + 一个 `NSCoding` shim 把整个策略对象解出来。
+结果是**一半成功**：
+
+```
+reason: contains=true  obj=Optional(optimizedBatteryCharging)  int=0  bool=false
+soclimit: contains=true  obj=nil  int=0  bool=false     ← 明明 contains 为 true
+drain: contains=true  obj=nil  int=0  bool=false
+owner: contains=true  obj=nil  int=0  bool=false
+```
+
+`containsValue(forKey:)` 全为 `true`，但除 `reason` 之外一律取不到值。
+对照 Python `plistlib` 读同一个文件，所有字段都正常 —— 说明问题不在文件，在解码器。
+
+根因：这个归档把**对象引用写成 UID、把标量内联写在对象字典里**。
+`NSKeyedUnarchiver` 的 keyed 容器只把 UID 形式的值填进它的 `_values` 表，
+遇到内联标量就给默认值（`nil`／`0`／`false`）。而 `reason` 恰好是 UID，所以只有它活着。
+
+（顺带排除的两条路：`CFKeyedArchiverUIDGetValue` 是私有符号，链接不过；
+`Mirror(reflecting:)` 对 CF 类型返回 0 个子节点。）
+
+### 解法：两条路读同一个 blob
+
+| 字段 | 怎么读 |
+|---|---|
+| `soclimit` / `drain` / `owner` / … | `PropertyListSerialization` 展开 `$objects`，直接取内联标量 |
+| `reason` | 它是 UID，用 `NSKeyedUnarchiver` + 只解 `reason` 的 shim（`@objc(WattupChargingReasonShim)`，嵌套类不显式命名编译不过） |
+
+两条路读的是同一段 blob、同一个对象，不会读到不一致的快照。
+策略对象用「带 `soclimit` 的字典」定位，而不是固定下标 —— `$objects` 的顺序由归档器决定，不是契约。
+
+### 语义边界（界面必须守住）
+
+**这个文件说的是系统被配置成要做什么，不是此刻正在做什么。** 由此分出两层：
+`ChargingPolicy` 只承载配置，`isHoldingNow(_:)` 结合实时电量才回答"此刻"。
+
+判定"此刻被按住"要三个事实同时成立：接着电源、**没有在充电**、电量已到停充点。
+只看 `reason` 会把"插着电正往 100% 充"也报成"停住了"。
+
+同理，「读不到」与「没有启用优化充电」是**两件不同的事**，文案必须分开；
+`terminated` 的策略记录里仍留着 `soclimit`，所以要有 `effectiveSocLimit`，
+否则会把一条已废弃的记录显示成"正在生效的上限"。
+（这条是自检的分支覆盖抓出来的 —— 最初 `terminated` 被渲染成了「读不到」。）
+
+### 调用节律
+
+读一次 **0.099 ms**（20 次平均，含读文件 + 两次 plist 展开 + unarchive），
+比一次电量计读取便宜。但仍按「不改就不问」处理：只在**有界面可见**时读，
+节流 60 秒（与电量计刷新对齐，搭同一次唤醒）；插拔、打开弹窗这些确定时刻强制重读。
+只在字段真的变了才写 `@Published`。
+
+### 实测（真机，2026-09-30）
+
+跑 `--selfcheck-charging-policy` 时机器恰好处于被按住的状态：
+
+```
+当前: 接电源=true  正在充电=false  电量=80%
+✅ 此刻确实被策略按住（接电 + 未充电 + 电量 80% ≥ 停充点 80%）—— 与读到的策略一致
+单次读取: 0.099 ms
+```
+
+这就是那个原始提问的现场取证：**策略与实时状态对上了**。
+
+### 没验证的事
+
+- 系统是否真的在按这条策略执行 —— 只能靠真机观察，代码无法自证；
+- 手动「充电上限」所用的 `reason` 取值（本机未设置过，取不到样本），
+  因此未收录的 `reason` **原样带出来展示**，不猜它的含义；
+- `owner` 字段的确切含义（只知道它是活进程 pid）。
+
+---
+
 ## 附录：复现命令
 
 ```bash
@@ -807,6 +914,19 @@ ioreg -c AppleSmartBattery -r | head -1
 # 5. 低电量模式（读得到，写不进 —— 需要 root）
 pmset -g | awk '/lowpowermode/ {print $2}'
 pmset -b lowpowermode 1   # → 'pmset' must be run as root...（exit=1）
+
+# 6. 系统充电策略（只读，不需要 root；注意 policies 是 NSKeyedArchiver 归档而非普通字典）
+ls -l /Library/Preferences/com.apple.powerd.charging.plist   # -rw-r--r-- root:wheel
+plutil -p /Library/Preferences/com.apple.powerd.charging.plist | head -3
+#   展开归档看 $objects（Python 侧最省事；Swift 侧见 §14 的两条路）
+python3 -c "
+import plistlib
+d = plistlib.load(open('/Library/Preferences/com.apple.powerd.charging.plist','rb'))
+o = plistlib.loads(d['policies'])['\$objects']
+p = [x for x in o if isinstance(x, dict) and 'soclimit' in x][0]
+print('reason =', o[p['reason']])          # UID 是 int 子类，直接当下标用
+print({k: v for k, v in p.items() if k != '\$class'})
+"
 ```
 
 ## 附录：应用自检入口（全部实测过）
@@ -821,6 +941,8 @@ $APP --selfcheck-statusitem-verdict             # 状态项可见性判定的三
 $APP --verify-popover                           # 合成点击 → 弹窗链路；打印真实窗口 frame 与 contentSize
 $APP --verify-popover-fit [--sections=…]         # 内容自然高度 / 可用高度 / 预计窗口下沿 vs 程序坞顶；含当前外观设置
 $APP --lpm                                      # 低电量模式自检：并排打印两种读法做交叉验证 + 写入被拒的行为
+$APP --selfcheck-charging-policy                # 系统充电策略：文件权限 / 归档原始值 / 解析结果 / 重复读一致性 /
+                                                # 七条文案分支 / 与实时电量状态对账 / 单次读取成本；末段列出「没验证的事」
 $APP --perf [--perf-iters=N]                    # 采样开销分解：各阶段 ms/次，按节律折算成每小时 CPU 毫秒
 $APP --selfcheck-power-event                    # 用合成快照验证插拔判定（首次不发 / 重复不发 / 翻转各发一次）
 $APP --watch-power-events --watch-seconds=120   # 真机拔插验证：事件实时打到 stderr

@@ -65,6 +65,29 @@ enum DumpCommand {
             print("  未连接适配器")
         }
 
+        print("")
+        print("=== 4. 系统充电策略（com.apple.powerd.charging.plist，只读）===")
+        // 这里补的是"系统被配置成要做什么"。上面第 1 段的「未充电原因 / 慢充原因」
+        // 是 IORegistry 报的**此刻**原因，两者互补：一边是配置，一边是现场。
+        if let policy = ChargingPolicyReader.read() {
+            p("reason", policy.reason)
+            p("停止充电电量(%)", policy.socLimit)
+            p("drain", policy.drain)
+            p("noChargeToFull", policy.noChargeToFull)
+            p("isEndOfCharge", policy.isEndOfCharge)
+            p("terminated", policy.terminated)
+            p("owner(pid)", policy.ownerPID)
+            if let s = RegistrySampler.sample() {
+                let live = ChargingHoldContext(isExternalConnected: s.isExternalConnected,
+                                               isCharging: s.isCharging,
+                                               percentage: s.percentage)
+                p("此刻被策略按住", policy.isHoldingNow(live))
+                p("界面徽标", ChargingPolicyDisplay.text(for: policy, live: live).badge)
+            }
+        } else {
+            print("  读不到 —— 这与「系统没有开启优化充电」是两回事，不能互相替代")
+        }
+
         exit(0)
     }
 

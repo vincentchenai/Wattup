@@ -32,7 +32,7 @@ struct PopoverContent: View {
         VStack(spacing: 9) {
             HeroCard(model: model)
 
-            if let alert = InsightSection.alert(for: s) {
+            if let alert = InsightSection.alert(for: s, heldByPolicyAt: model.holdingChargeLimit) {
                 InsightCard(symbol: alert.symbol, title: alert.title,
                             detail: alert.detail, tint: alert.tint)
             }
@@ -211,13 +211,26 @@ private struct InsightSection {
         let tint: Color
     }
 
-    static func alert(for s: BatterySnapshot) -> Alert? {
+    /// 至多返回一条。顺序即优先级：真问题在前，纯解释在后。
+    ///
+    /// 「接电但没在充」这一条直接回答用户最容易有的疑问 ——
+    /// 它**只在确实被系统按住的时刻**出现（接着电源、没有在充电、电量已到策略位置），
+    /// 不靠"读到了优化充电这个配置"就瞎报。
+    static func alert(for s: BatterySnapshot, heldByPolicyAt limit: Int?) -> Alert? {
         if s.isNetDischargingWhilePlugged {
             let short = s.adapterHeadroomWatts.map { Fmt.watts(abs($0), digits: 1) } ?? "—"
             return Alert(
                 symbol: "exclamationmark.triangle.fill",
                 title: "适配器功率不够用",
                 detail: "整机在满载运行，适配器顶不住，缺的 \(short) 由电池倒灌补上。电量会一边插着电一边下降。",
+                tint: JB.orange)
+        }
+        if let limit {
+            return Alert(
+                symbol: "pause.circle.fill",
+                title: "已接电源，但在 \(limit)% 停住了",
+                detail: "这是系统「优化电池充电」在按着，不是没插好、也不是适配器不够。"
+                    + "它会在你真正要用之前再充满；偶尔充到 100% 是校准。",
                 tint: JB.orange)
         }
         if s.telemetrySource == .derived {

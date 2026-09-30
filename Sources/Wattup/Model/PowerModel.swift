@@ -60,6 +60,71 @@ final class PowerModel: ObservableObject {
     /// 写入失败时的说明文案，显示在开关下方
     @Published private(set) var lowPowerModeHint: String?
 
+    // MARK: 系统充电策略（只读）
+
+    /// 系统充电策略。`nil` = **读不到**，不表示"没有开启优化充电"。
+    ///
+    /// 只读：这个文件由 powerd 维护，读它不需要任何权限，改写才需要。
+    /// 界面上因此呈现为状态而不是开关 —— 见 `SettingsWindow` 的充电分区。
+    @Published private(set) var chargingPolicy: ChargingPolicy?
+
+    /// 判断策略此刻是否正在生效所需的实时电量事实
+    var chargingHoldContext: ChargingHoldContext {
+        ChargingHoldContext(isExternalConnected: snapshot.isExternalConnected,
+                            isCharging: snapshot.isCharging,
+                            percentage: snapshot.percentage)
+    }
+
+    /// 策略的界面文案。纯映射，界面直接取用，不在视图里再写一套判断。
+    var chargingPolicyText: ChargingPolicyDisplay.Text {
+        ChargingPolicyDisplay.text(for: chargingPolicy, live: chargingHoldContext)
+    }
+
+    /// 策略此刻是否正把电量按在某个位置 —— 弹窗洞察卡用它决定要不要解释"为什么停在 80%"。
+    var isChargingHeldByPolicy: Bool { holdingChargeLimit != nil }
+
+    /// 若此刻正被策略按住，返回策略设定的停充点；否则 `nil`。
+    ///
+    /// 单独抽出来是为了让洞察卡拿到一个**值**而不是模型引用 ——
+    /// `InsightSection.alert` 是 nonisolated 的纯函数，不该去碰 `@MainActor` 的模型。
+    var holdingChargeLimit: Int? {
+        guard let policy = chargingPolicy, policy.isHoldingNow(chargingHoldContext) else { return nil }
+        return policy.effectiveSocLimit
+    }
+
+    /// 策略两次读取之间的最小间隔。
+    ///
+    /// 读一次约 0.3 ms（700 字节文件 + 两次 plist 展开 + 一次 unarchive），
+    /// 便宜到能进轮询；但策略本身**极少变**（用户改设置、系统释放到 100%、插拔），
+    /// 所以按"不改就不问"的原则：只在有界面可见时读，且至少间隔 60 秒 ——
+    /// 与电量计的刷新周期对齐，搭同一次唤醒。
+    /// 插拔、打开弹窗这类确定的时刻另有强制刷新，不必等这 60 秒。
+    private static let chargingPolicyInterval: TimeInterval = 60
+    private var lastChargingPolicyReadAt = Date.distantPast
+    private var lastChargingPolicySignature: String?
+
+    /// 读一次策略。`force = true` 时忽略节流。
+    ///
+    /// 只在**数值真的变了**才写 `@Published` —— 每次写入都会让整棵视图树失效，
+    /// 而策略在绝大多数轮询里都是同一份内容。
+    func refreshChargingPolicy(force: Bool = false) {
+        let now = Date()
+        guard force || now.timeIntervalSince(lastChargingPolicyReadAt) >= Self.chargingPolicyInterval else { return }
+        lastChargingPolicyReadAt = now
+
+        let fresh = ChargingPolicyReader.read()
+        let signature = Self.signature(of: fresh)
+        guard signature != lastChargingPolicySignature else { return }
+        lastChargingPolicySignature = signature
+        chargingPolicy = fresh
+    }
+
+    private static func signature(of policy: ChargingPolicy?) -> String {
+        guard let policy else { return "nil" }
+        return "\(policy.reason ?? "-")/\(policy.socLimit.map(String.init) ?? "-")"
+            + "/\(policy.terminated)/\(policy.noChargeToFull)/\(policy.drain)"
+    }
+
     // MARK: 弹窗尺寸与折叠
 
     /// 弹窗内容区高度。由 AppDelegate 按「内容自然高度」与「程序坞之上可用高度」取小后写入。
@@ -200,6 +265,9 @@ final class PowerModel: ObservableObject {
         guard !started else { return }
         started = true
 
+        // 首屏就要有值：策略不会因为"等 60 秒再读"而少读一次，而是这一档本来就要读一次
+        refreshChargingPolicy(force: true)
+
         monitor.start { [weak self] in
             Task { @MainActor in
                 self?.handlePowerSourceChange()
@@ -256,6 +324,9 @@ final class PowerModel: ObservableObject {
             guard let self else { return }
             await self.energySampler.resetBaseline()
             self.energy = EnergyScanResult()
+            // 插拔会改变策略的生效状态（按住的判据里有"接着电源"这一条），
+            // 也可能让系统在释放/重新按住之间切换 —— 这一档不等节流，立刻重读
+            self.refreshChargingPolicy(force: true)
             await self.refreshSnapshot(forceEnergyScan: true)
         }
     }
@@ -325,6 +396,10 @@ final class PowerModel: ObservableObject {
         publish(new)
         publishDisplayMetrics(sampleMS: Date().timeIntervalSince(start) * 1000,
                               secondsSinceGauge: new.secondsSinceGaugeUpdate)
+
+        // 充电策略只在有人看的时候读 —— 它只服务于界面展示（设置面板的状态行、
+        // 弹窗的洞察卡），没有任何界面可见时读它是纯浪费。节流在方法内部。
+        if isAnySurfaceVisible() { refreshChargingPolicy() }
 
         // 能耗扫描。基线还没建立时用更短的间隔 —— 首次扫描只建基线不算增量，
         // 按常规的 30 秒间隔会让用户干等半分钟才看到排行。

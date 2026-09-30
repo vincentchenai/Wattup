@@ -119,6 +119,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // --selfcheck-charging-policy：验证「只读系统充电策略」这条链路。
+        // 等一次采样落地后再跑 —— 第 ⑥ 步要拿实时电量状态与策略对账，
+        // 在 snapshot 还是空的时候跑会把"没接电源"误当成结论。
+        if CommandLine.arguments.contains("--selfcheck-charging-policy") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                guard let self else { NSApp.terminate(nil); return }
+                self.log("=== 系统充电策略读取自检 ===")
+                for line in ChargingPolicyCheck.run(live: self.model.chargingHoldContext) {
+                    self.log(line)
+                }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+
         // --selfcheck-power-event：用合成快照验证插拔判定（不发真提示）
         if CommandLine.arguments.contains("--selfcheck-power-event") {
             log("=== 插拔事件判定自检 ===")
