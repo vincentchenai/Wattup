@@ -7,7 +7,7 @@ macOS 菜单栏上的充电状态工具。电量、充放电功率、电池温�
 
 <p align="center">
   <img src="docs/shots/popover_v6_light.png" width="280" alt="弹窗">
-  <img src="docs/shots/settings_menuBar_v6.png" width="430" alt="设置面板">
+  <img src="docs/shots/settings_menuBar_v7.png" width="430" alt="设置面板">
   <br><br>
   <img src="docs/shots/toast_plug_v7.png" width="280" alt="屏幕正上方的提示胶囊">
 </p>
