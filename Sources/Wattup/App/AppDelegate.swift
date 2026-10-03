@@ -556,6 +556,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 提示胶囊
 
+    /// 插拔提示的固定延迟：等功率读数稳定下来
+    private static let plugToastSettleSeconds: TimeInterval = 1.4
+    /// 插电后再等 `IsCharging` 翻身的**上限** —— 翻了立刻弹，不傻等满
+    private static let plugToastChargeWaitSeconds: TimeInterval = 4.0
+
     /// 提示到达。**插拔要晚一拍**：插上电源的瞬间功率读数还没稳定，
     /// 抢那一两秒只会弹出一个 0.0 W 的提示；告警类没有这个问题，立即弹。
     private func handleToast(_ spec: ToastSpec) {
@@ -568,16 +573,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 插拔提示要等状态落定再弹。
+    ///
+    /// 插电这一路要等两件事：
+    /// 1. 插上电源的瞬间功率读数还没稳定，抢那一两秒只会弹出一个 `0.0 W`；
+    /// 2. 更要紧的是 `IsCharging` —— 电量计要 1–3 秒才把「正在充电」翻过来。
+    ///    提示里最有价值的内容（正在充电 / 多久充满 / 充入功率）全都要等它，
+    ///    抢在它之前弹只会得到一句「未在充电」，而用户明明看着它在充。
+    ///
+    /// 所以插电时**等到 `IsCharging` 翻身或超时**为止，中间按需重采
+    /// （主循环关闭弹窗时 5 秒一拍，等它等不到）。拔电没有可等的事实，仍按固定延迟。
     private func schedulePlugToast(_ kind: ToastKind) {
         pendingToast?.cancel()
         pendingToast = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_400_000_000)
+            // 第一拍：等功率读数稳定
+            try? await Task.sleep(nanoseconds: UInt64(Self.plugToastSettleSeconds * 1_000_000_000))
             if Task.isCancelled { return }
             guard let self else { return }
-            // 1.4 秒里状态可能又翻回去了（瞬时插拔 / 接触不良），确认一下再弹
+
+            // 第二拍：插电等 `IsCharging`；拔电直接过
+            if kind == .pluggedIn {
+                let deadline = Date().addingTimeInterval(Self.plugToastChargeWaitSeconds)
+                while Date() < deadline {
+                    let snap = self.model.snapshot
+                    if snap.isCharging || snap.isFullyCharged { break }
+                    // 主循环这一拍太慢，主动插一拍
+                    await self.model.refreshNow()
+                    if Task.isCancelled { return }
+                    let after = self.model.snapshot
+                    if after.isCharging || after.isFullyCharged { break }
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                    if Task.isCancelled { return }
+                }
+            }
+
+            // 落定前再确认方向：中途翻回去（瞬时插拔 / 接触不良）就不弹
             let now: ToastKind = self.model.snapshot.isExternalConnected ? .pluggedIn : .unplugged
             guard now == kind else { return }
-            // 用「此刻」的最新快照 —— 事件发生那一刻的功率还是旧的
             self.toast.show(ToastSpec(kind: kind, snapshot: self.model.snapshot),
                             seconds: self.settings.toastSeconds)
         }

@@ -185,6 +185,9 @@ struct StatusToastView: View {
                 if let t = s.timeToFullMinutes { return "\(Fmt.duration(t))后充满\(watts)" }
                 return "正在充电\(watts.isEmpty ? " · 当前 \(s.percentage)%" : watts)"
             }
+            // 接电但没在充，最常见的原因就是被充电上限按住了 ——
+            // 直接说出来，别只留一句「未在充电」让人以为没插好（那是这套提示最常被问的一句）。
+            if s.isHoldingAtChargeLimit { return "已到充电上限 · 当前 \(s.percentage)%" }
             return "未在充电 · 当前 \(s.percentage)%"
 
         case .unplugged:

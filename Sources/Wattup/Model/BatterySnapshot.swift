@@ -274,7 +274,10 @@ struct BatterySnapshot: Sendable {
         if isNetDischargingWhilePlugged { return "插电但净放电" }
         if isFullyCharged { return "已充满" }
         if isCharging { return "充电中" }
-        if isExternalConnected { return "已接电源 · 未充电" }
+        if isExternalConnected {
+            // 「已接电源 · 未充电」最常被读成「没插好」。被充电上限按住时直接说明白。
+            return isHoldingAtChargeLimit ? "已接电源 · 已到充电上限" : "已接电源 · 未充电"
+        }
         return "电池供电"
     }
 }

@@ -564,6 +564,16 @@ final class PowerModel: ObservableObject {
         }
     }
 
+    /// 立即重采一次，不等主循环那一拍。
+    ///
+    /// 给「插电提示等 `IsCharging` 翻身」用：弹窗关闭时主循环是 5 秒一拍，
+    /// 而电量计把「正在充电」翻过来只要 1–3 秒 —— 等主循环等不到，
+    /// 于是提示会一直停在「未在充电」。只在插电后的几秒内被调用几次，
+    /// **不改变常驻节律**（常驻仍是 5 秒 / 弹窗打开 1 秒）。
+    func refreshNow() async {
+        await refreshSnapshot(forceEnergyScan: false)
+    }
+
     // MARK: - 采样
 
     /// 只服务于界面展示的指标。
