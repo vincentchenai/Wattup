@@ -278,6 +278,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        // --selfcheck-power-caliber：功率口径仲裁 + 「插电净放电」告警门槛 + 界面取色
+        if CommandLine.arguments.contains("--selfcheck-power-caliber") {
+            log("=== 功率口径仲裁自检 ===")
+            for line in model.selfCheckPowerCaliber() { log(line) }
+            // 洞察卡是第三个会被染成橙色的界面 —— 它的取色留在 PopoverView 里，
+            // 所以从这一层拼上去：模型不该反过来依赖视图。
+            for line in InsightSection.selfCheckColors() { log(line) }
+            NSApp.terminate(nil)
+            return
+        }
+
         // --verify-popover-fit：把「内容自然高度 / 可用高度 / 最终尺寸」打出来
         if CommandLine.arguments.contains("--verify-popover-fit") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in

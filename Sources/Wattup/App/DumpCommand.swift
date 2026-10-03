@@ -107,6 +107,10 @@ enum DumpCommand {
         p("电池温度(°C)", s.batteryTemperatureC)
         divider()
         p("遥测来源", s.telemetrySource.rawValue)
+        p("判据口径", s.effectiveTelemetrySource.rawValue
+            + (s.effectiveTelemetrySource == s.telemetrySource ? "" : " ← 遥测被弃用，已降级"))
+        p("两套口径互证", s.batteryPowerIsCorroborated.map { $0 ? "一致" : "不一致 ← 遥测被弃用" }
+            ?? "仅一套可用，无从核对")
         p("适配器输入(mW)", s.systemPowerInMW)
         p("系统负载(mW)", s.systemLoadMW)
         p("系统电流(mA)", s.systemCurrentInMA)
@@ -136,6 +140,7 @@ enum DumpCommand {
         p("距刷新(秒)", s.secondsSinceGaugeUpdate)
         divider()
         p("净功率(W)", s.batteryNetWatts)
+        p(" — 遥测原始(W)", s.batteryNetWattsTelemetry)
         p("电压电流口径(W)", s.packWattsFromVI)
         p("恒等式偏差(W)", s.identityDiscrepancyWatts)
         p("插电净放电", s.isNetDischargingWhilePlugged)

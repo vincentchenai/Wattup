@@ -133,9 +133,12 @@ echo "==> 完成: ${APP_DIR}  (v${VERSION})"
 
 if [ "${DO_INSTALL}" = 1 ]; then
     echo "==> 安装到 ${INSTALL_DIR}"
-    if pgrep -f "${INSTALL_DIR}/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
-        echo "    退出正在运行的旧实例"
-        pkill -f "${INSTALL_DIR}/Contents/MacOS/${APP_NAME}" || true
+    # 按 bundle 内的可执行路径匹配，而不是写死 ${INSTALL_DIR} ——
+    # 从 .build/Wattup.app 直接启动的实例路径不含 /Applications，
+    # 只匹配 INSTALL_DIR 会漏掉它，装完就变成两个菜单栏图标。
+    if pgrep -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" >/dev/null 2>&1; then
+        echo "    退出正在运行的旧实例（含从 .build 启动的）"
+        pkill -f "${APP_NAME}.app/Contents/MacOS/${APP_NAME}" || true
         sleep 1
     fi
     if ditto "${APP_DIR}" "${INSTALL_DIR}" 2>/dev/null; then

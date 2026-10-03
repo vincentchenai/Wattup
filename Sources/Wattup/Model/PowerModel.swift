@@ -259,8 +259,241 @@ final class PowerModel: ObservableObject {
         return lines
     }
 
-    // MARK: - 生命周期
+    /// 自检：功率口径仲裁（`--selfcheck-power-caliber`）。
+    ///
+    /// ② 号用例就是真机上抓到的那个状态（遥测说电池放电、电池计说充电）。
+    /// 那条分支在真机上要撞运气才能复现，所以固化成断言 ——
+    /// 免得以后改仲裁规则时，把「插电净放电」的误报又悄悄放回来。
+    func selfCheckPowerCaliber() -> [String] {
+        var lines: [String] = []
 
+        func snap(plugged: Bool = true,
+                  telemetryMW: Int?, voltageMV: Int? = nil, amperageMA: Int? = nil,
+                  loadMW: Int? = nil, inputMW: Int? = nil,
+                  percentage: Int = 0, holdingAtLimit: Bool = false,
+                  charging: Bool = false, fullyCharged: Bool = false) -> BatterySnapshot {
+            var s = BatterySnapshot()
+            s.hasBattery = true
+            s.isExternalConnected = plugged
+            s.percentage = percentage
+            s.isCharging = charging
+            s.isFullyCharged = fullyCharged
+            s.batteryPowerMW = telemetryMW
+            s.packVoltageMV = voltageMV
+            s.packAmperageMA = amperageMA
+            s.systemLoadMW = loadMW
+            s.systemPowerInMW = inputMW
+            s.isHoldingAtChargeLimit = holdingAtLimit
+            s.telemetrySource = telemetryMW != nil ? .telemetry : .derived
+            return s
+        }
+
+        struct Case {
+            let name: String
+            let snapshot: BatterySnapshot
+            let arbitrated: Double?
+            let netDischarge: Bool
+            let load: Double?
+            let degraded: Bool
+        }
+
+        let cases: [Case] = [
+            // ① 文档里那个真实告警场景（20 W 充电器推 M5 Air）：两套口径一致指向放电
+            Case(name: "两套一致 · 都在放电（20 W 充电器场景）",
+                 snapshot: snap(telemetryMW: -3862, voltageMV: 12500, amperageMA: -308,
+                                loadMW: 22174, inputMW: 18312),
+                 arbitrated: -3.862, netDischarge: true, load: 22.174, degraded: false),
+
+            // ② 真机抓到的故障态：遥测说放电 26.5 W，电池计说充电 34.1 W
+            Case(name: "两套相反 · 遥测说放电、物理说充电（实测故障态）",
+                 snapshot: snap(telemetryMW: -26498, voltageMV: 12710, amperageMA: 2683,
+                                loadMW: 72877, inputMW: 46379),
+                 arbitrated: 34.101, netDischarge: false, load: 12.278, degraded: true),
+
+            // ③ 反方向相反：物理口径才是"放电"那一方，告警必须照常发出
+            Case(name: "两套相反 · 遥测说充电、物理说放电",
+                 snapshot: snap(telemetryMW: 20000, voltageMV: 12500, amperageMA: -2000,
+                                loadMW: 60000, inputMW: 40000),
+                 arbitrated: -25.0, netDischarge: true, load: 65.0, degraded: true),
+
+            // ④ 只有遥测：「没有反证」≠「被反证」，仍然采信遥测
+            Case(name: "只有遥测口径",
+                 snapshot: snap(telemetryMW: -5000, loadMW: 30000, inputMW: 25000),
+                 arbitrated: -5.0, netDischarge: true, load: 30.0, degraded: false),
+
+            // ⑤ 只有物理口径（遥测缺失 → 来源本来就是降级档）。
+            //    `SystemPowerIn` 也没有，**无法证明适配器在出力** → 不报警。
+            //    这是刻意选的保守方向：宁可漏一次真告警，也不要在保电/切电池时误报。
+            Case(name: "只有物理口径 · 无法证明适配器在出力",
+                 snapshot: snap(telemetryMW: nil, voltageMV: 12000, amperageMA: -500),
+                 arbitrated: -6.0, netDischarge: false, load: nil, degraded: true),
+
+            // ⑥ 没插电：电池放电是正常的，不算「插电净放电」
+            Case(name: "未接电源 · 电池放电属正常",
+                 snapshot: snap(plugged: false, telemetryMW: -3000, voltageMV: 12000, amperageMA: -250),
+                 arbitrated: -3.0, netDischarge: false, load: nil, degraded: false),
+
+            // ⑦ **本次修正的主因**：优化充电按 80% 保电，系统切到纯电池放电把电量放回限值。
+            //    电池在净放电、幅度就是整机负载（7 W，比 ① 的真实缺口还大），
+            //    但适配器根本没被要求出力（SystemPowerIn = 0）→ 不是"适配器不够"。
+            //    旧判据（净功率 < -0.1 W）在这里会持续误报橙色。
+            Case(name: "按上限保电 · 系统切到电池放电（实测 86% 限 80%）",
+                 snapshot: snap(telemetryMW: -7023, voltageMV: 12400, amperageMA: -566,
+                                loadMW: 7023, inputMW: 0,
+                                percentage: 86, holdingAtLimit: true),
+                 arbitrated: -7.023, netDischarge: false, load: 7.023, degraded: false),
+
+            // ⑧ 有生效策略但**此刻不在保电窗口**（电量还在限值以下、正常充电中），
+            //    这时若适配器真顶不住，告警必须照常发出 —— 不能因为"有策略"就一律闭嘴
+            Case(name: "有策略但未进入保电窗口 · 欠功率仍要报警",
+                 snapshot: snap(telemetryMW: -3862, voltageMV: 12500, amperageMA: -308,
+                                loadMW: 22174, inputMW: 18312,
+                                percentage: 55, holdingAtLimit: false),
+                 arbitrated: -3.862, netDischarge: true, load: 22.174, degraded: false),
+
+            // ⑨ 适配器挂着但没在出力、又没有策略解释 —— 依然不报。
+            //    这是"电池放电"与"适配器不够"之间那条线的另一半：
+            //    适配器没被要求出力时，电池放电是系统选择，构不成"功率不足"的结论。
+            Case(name: "适配器挂着但没出力 · 不构成功率不足",
+                 snapshot: snap(telemetryMW: -4000, voltageMV: 12400, amperageMA: -320,
+                                loadMW: 4000, inputMW: 0),
+                 arbitrated: -4.0, netDischarge: false, load: 4.0, degraded: false),
+
+            // ⑩ **用户直接报的那条**：插上充电器、已经开始充电。
+            //    此刻遥测块还停在插电前那一拍（`SystemPowerIn` 仍是 0、仍在报放电），
+            //    旧逻辑于是把插电提示染成橙色。电量计说 `IsCharging = true` ——
+            //    两个来源打架时不下结论，直接放行。
+            //    顺带：这种输入下反推整机负载会得到负数，已改成返回 nil 而不是荒谬值。
+            Case(name: "插电且正在充电 · 遥测还停在插电前那一拍",
+                 snapshot: snap(telemetryMW: -7023, voltageMV: 12580, amperageMA: 2100,
+                                loadMW: 7023, inputMW: 0,
+                                percentage: 78, charging: true),
+                 arbitrated: 26.418, netDischarge: false, load: nil, degraded: true),
+
+            // ⑪ 已充满后由适配器供电：电池端出现瓦级倒灌也不该报 ——
+            //    「已充满」和「正在充电」一样是正向状态，不该被渲染成"适配器不够"。
+            //    这条刻意把幅度设到 2 W（远超 0.5 W 门槛）、适配器也在出力（5.2 W），
+            //    让**只有** `!isFullyCharged` 这一条能把它挡下来。
+            Case(name: "已充满 · 由适配器供电，电池端仍有倒灌",
+                 snapshot: snap(telemetryMW: -2000, voltageMV: 12800, amperageMA: -160,
+                                loadMW: 6100, inputMW: 5200,
+                                percentage: 100, fullyCharged: true),
+                 arbitrated: -2.0, netDischarge: false, load: 6.1, degraded: false),
+        ]
+
+        var allPassed = true
+        for c in cases {
+            let s = c.snapshot
+            var problems: [String] = []
+            if !close(s.batteryNetWatts, c.arbitrated) {
+                problems.append("净功率  期望 \(fmt(c.arbitrated))  实得 \(fmt(s.batteryNetWatts))")
+            }
+            if s.isNetDischargingWhilePlugged != c.netDischarge {
+                problems.append("插电净放电  期望 \(c.netDischarge)  实得 \(s.isNetDischargingWhilePlugged)")
+            }
+            if !close(s.systemLoadWatts, c.load) {
+                problems.append("整机消耗  期望 \(fmt(c.load))  实得 \(fmt(s.systemLoadWatts))")
+            }
+            if s.effectiveTelemetrySource.isDegraded != c.degraded {
+                problems.append("来源降级  期望 \(c.degraded)  实得 \(s.effectiveTelemetrySource.isDegraded)")
+            }
+
+            lines.append("\(problems.isEmpty ? "✅" : "❌") \(c.name)")
+            if problems.isEmpty {
+                lines.append("     净功率 \(fmt(s.batteryNetWatts))｜适配器输入 \(fmt(s.systemInputWatts))"
+                             + "｜整机 \(fmt(s.systemLoadWatts))｜保电 \(s.isHoldingAtChargeLimit ? "是" : "否")"
+                             + "｜告警 \(s.isNetDischargingWhilePlugged ? "发" : "不发")")
+            } else {
+                for p in problems { lines.append("     · \(p)") }
+                allPassed = false
+            }
+        }
+        lines.append(allPassed ? "✅ 十一条分支全部符合预期" : "❌ 有分支不符合预期")
+
+        // ── 颜色门控 ──
+        // 上面断言的是"结论"，这里断言**界面真正取到的颜色**。
+        // 用户看到的是颜色，不是布尔值；两者之间隔着一层映射，就得在这一层也钉住。
+        lines.append("")
+        lines.append("── 界面实际取色（状态栏图标 + 插电提示） ──")
+
+        let colorCases: [(String, BatterySnapshot, Bool)] = [
+            ("插电 · 正在充电（遥测还停在插电前那一拍）",
+             snap(telemetryMW: -7023, voltageMV: 12580, amperageMA: 2100,
+                  loadMW: 7023, inputMW: 0, percentage: 78, charging: true), true),
+
+            ("插电 · 按上限保电，系统切到电池放电",
+             snap(telemetryMW: -7023, voltageMV: 12400, amperageMA: -566,
+                  loadMW: 7023, inputMW: 0, percentage: 86, holdingAtLimit: true), true),
+
+            ("插电 · 20 W 充电器真的顶不住（两套口径一致指向放电）",
+             snap(telemetryMW: -3862, voltageMV: 12500, amperageMA: -308,
+                  loadMW: 22174, inputMW: 18312, percentage: 62), false),
+        ]
+
+        for (name, s, expectGreen) in colorCases {
+            let toastHex = resolvedHex(s.heroTint, dark: true)
+            let iconColor = MenuBarTint.color(for: s, isDark: true, statusColors: true)
+            let iconHex = hex(of: iconColor)
+
+            // 深色档的语义色：绿 #00D832、告警橙 #FF8A00
+            let toastIsGreen = toastHex == "#00D832"
+            let iconIsOrange = iconHex == "#FF8A00"
+
+            // 期望绿：提示取色必须是绿、图标不能是告警橙
+            // 期望橙：两类取色都必须落在告警橙上（真告警不能被这次修改静默吞掉）
+            let ok = expectGreen
+                ? (toastIsGreen && !iconIsOrange)
+                : (!toastIsGreen && iconIsOrange)
+
+            lines.append("\(ok ? "✅" : "❌") \(name)")
+            lines.append("     提示色 \(toastHex)\(toastIsGreen ? "（绿）" : "")"
+                         + "｜图标色 \(iconHex)\(iconIsOrange ? "（告警橙）" : "")"
+                         + "｜期望 \(expectGreen ? "绿" : "橙")")
+            if !ok { allPassed = false }
+        }
+
+        lines.append("")
+        lines.append("ℹ️ 未验证：保电窗口里 `SystemPowerIn` 的真实读数（本次没抓到插电+保电的现场）；")
+        lines.append("   ⑦⑨ 两条依赖「适配器没出力」这个判据，现场确认后会回来收紧或放宽。")
+        return lines
+    }
+
+    /// 把 SwiftUI 的 `Color` 解析成 sRGB 十六进制。
+    ///
+    /// **不能直接写 `color == JB.green`**：`JB` 里的令牌都是
+    /// `Color(nsColor: .adaptive(...))`，底层是**动态 NSColor** ——
+    /// 每次取到的是新实例，`Color ==` 比的是身份而不是数值，同一份绿色也会判不等
+    /// （这个自检第一版就是这么假红了一轮）。所以一律解析到分量再比。
+    private func resolvedHex(_ color: Color, dark: Bool) -> String {
+        var hex = "#??????"
+        let appearance = NSAppearance(named: dark ? .darkAqua : .aqua) ?? NSAppearance.currentDrawing()
+        appearance.performAsCurrentDrawingAppearance {
+            hex = self.hex(of: NSColor(color))
+        }
+        return hex
+    }
+
+    private func hex(of color: NSColor) -> String {
+        guard let n = color.usingColorSpace(.sRGB) else { return "#??????" }
+        return String(format: "#%02X%02X%02X",
+                      Int((n.redComponent * 255).rounded()),
+                      Int((n.greenComponent * 255).rounded()),
+                      Int((n.blueComponent * 255).rounded()))
+    }
+
+    private func close(_ a: Double?, _ b: Double?) -> Bool {
+        switch (a, b) {
+        case (nil, nil):           return true
+        case let (x?, y?):         return abs(x - y) < 0.05
+        default:                   return false
+        }
+    }
+
+    private func fmt(_ v: Double?) -> String {
+        v.map { String(format: "%.2f W", $0) } ?? "nil"
+    }
+
+    // MARK: - 生命周期
     func start() {
         guard !started else { return }
         started = true
@@ -450,7 +683,28 @@ final class PowerModel: ObservableObject {
     }
 
     /// 只有电量计真的更新了才发布新快照
-    private func publish(_ new: BatterySnapshot) {
+    private func publish(_ incoming: BatterySnapshot) {
+        var new = incoming
+
+        // 把「系统是否正按充电上限保电」这个**非 IORegistry 事实**写进快照。
+        //
+        // 放这里而不是放进采样器：这个结论来自 powerd 的策略文件（ChargingPolicy），
+        // 不是硬件读数，采样器不该知道它。
+        //
+        // 它必须参与 `isNetDischargingWhilePlugged` 的判定 ——
+        // 保电时 macOS 会定期切到纯电池供电把电量放回限值，那几秒里电池确实在净放电，
+        // 但那不是「适配器功率不够」（详见 BatterySnapshot 里的说明）。
+        // 用 `new` 而不是 `snapshot` 构上下文：快照还没发布，实时状态以这一拍为准。
+        if let policy = chargingPolicy {
+            new.isHoldingAtChargeLimit = policy.isHoldingNow(
+                ChargingHoldContext(isExternalConnected: new.isExternalConnected,
+                                    isCharging: new.isCharging,
+                                    percentage: new.percentage))
+        } else {
+            // 读不到策略时按「没有保电」处理，宁可多报一次也不静默吞掉真实告警
+            new.isHoldingAtChargeLimit = false
+        }
+
         // 插拔检测放在 publish 里（而不是 refresh 的某一条分支上），
         // 保证「有电池」与「无电池机型」两条路径都能发出事件。
         // 判据用「上一次真实生效的连接状态」，不能用上一次**发布**的快照 ——
@@ -466,7 +720,8 @@ final class PowerModel: ObservableObject {
             new.isCharging != snapshot.isCharging ||
             new.isExternalConnected != snapshot.isExternalConnected ||
             new.telemetrySource != snapshot.telemetrySource ||
-            new.batteryPowerMW != snapshot.batteryPowerMW
+            new.batteryPowerMW != snapshot.batteryPowerMW ||
+            new.isHoldingAtChargeLimit != snapshot.isHoldingAtChargeLimit
 
         if gaugeChanged || significantChange || refreshCount == 0 {
             snapshot = new

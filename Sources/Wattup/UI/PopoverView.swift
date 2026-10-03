@@ -171,11 +171,11 @@ private struct HeroCard: View {
                     .foregroundStyle(JB.faint)
                 }
 
-                if s.telemetrySource.isDegraded {
+                if s.effectiveTelemetrySource.isDegraded {
                     HStack(spacing: 5) {
                         Image(systemName: "exclamationmark.triangle")
                             .font(.system(size: 9))
-                        Text("功率来源降级：\(s.telemetrySource.label)")
+                        Text("功率来源降级：\(s.effectiveTelemetrySource.label)")
                             .font(.system(size: 9.5))
                     }
                     .foregroundStyle(JB.orange)
@@ -203,7 +203,7 @@ private struct MicroStat: View {
 
 // MARK: - 洞察（Juicy 的琥珀描边提示卡）
 
-private struct InsightSection {
+struct InsightSection {
     struct Alert {
         let symbol: String
         let title: String
@@ -233,7 +233,24 @@ private struct InsightSection {
                     + "它会在你真正要用之前再充满；偶尔充到 100% 是校准。",
                 tint: JB.orange)
         }
-        if s.telemetrySource == .derived {
+        if s.effectiveTelemetrySource == .derived {
+            // 两种情况都会落到「推导口径」，**原因必须说清是哪一个** ——
+            // 「没读到」和「读到了但与物理口径打架」对用户意味着完全不同的事。
+            //
+            // 但「打架」这一条要排除充电中：插电后遥测块（`PowerTelemetryData`，
+            // 60 秒才刷新一次）还没跟上，那一拍的"打架"是暂时现象，
+            // 拿它当故障提示会让人以为机器坏了。判据与「适配器功率不足」告警共用
+            // 同一条原则：正在充电是正向状态，来源矛盾时不下结论（见设计文档 §15）。
+            if s.batteryPowerIsCorroborated == false && !s.isCharging {
+                let disc = s.identityDiscrepancyWatts.map { Fmt.watts($0, digits: 1) } ?? "—"
+                let telemetrySays = (s.batteryNetWattsTelemetry ?? 0) < 0 ? "放电" : "充电"
+                return Alert(
+                    symbol: "exclamationmark.triangle.fill",
+                    title: "功率遥测与电池读数不一致",
+                    detail: "遥测说电池在\(telemetrySays)，电池端电压 × 电流却指向相反方向，"
+                        + "两边差 \(disc)。这一轮以物理口径为准，功率来源已降级。",
+                    tint: JB.orange)
+            }
             return Alert(
                 symbol: "info.circle.fill",
                 title: "功率来自推导口径",
@@ -241,6 +258,74 @@ private struct InsightSection {
                 tint: JB.orange)
         }
         return nil
+    }
+
+    /// 自检：洞察卡的**选卡结果**（`--selfcheck-power-caliber` 的第二段）。
+    ///
+    /// 这里是第三个会被染成橙色的界面（前两个是状态栏图标与顶部提示胶囊）。
+    /// 用户看到「插上充电器却是橙色」时，这一处同样会中招 —— 所以一并钉住。
+    /// 断言的是**标题**而不是颜色：选错卡比选对卡配错色更常见，也更容易悄悄回退。
+    static func selfCheckColors() -> [String] {
+        var lines: [String] = ["", "── 洞察卡（弹窗内，第三个橙色界面）──"]
+        var allPassed = true
+
+        func snap(charging: Bool = false, telemetryMW: Int?, voltageMV: Int? = nil,
+                  amperageMA: Int? = nil, inputMW: Int? = nil,
+                  holdingAtLimit: Bool = false, percentage: Int = 80) -> BatterySnapshot {
+            var s = BatterySnapshot()
+            s.hasBattery = true
+            s.isExternalConnected = true
+            s.percentage = percentage
+            s.isCharging = charging
+            s.batteryPowerMW = telemetryMW
+            s.packVoltageMV = voltageMV
+            s.packAmperageMA = amperageMA
+            s.systemPowerInMW = inputMW
+            s.isHoldingAtChargeLimit = holdingAtLimit
+            s.telemetrySource = telemetryMW != nil ? .telemetry : .derived
+            return s
+        }
+
+        struct Case {
+            let name: String
+            let snapshot: BatterySnapshot
+            let limit: Int?
+            /// 期望的标题；`nil` = 期望根本不出卡
+            let expect: String?
+        }
+
+        let cases: [Case] = [
+            Case(name: "插电 · 正在充电（遥测停在插电前那一拍）→ 不出「不一致」卡",
+                 snapshot: snap(charging: true, telemetryMW: -7023, voltageMV: 12580,
+                                amperageMA: 2100, inputMW: 0, percentage: 78),
+                 limit: nil, expect: "功率来自推导口径"),
+
+            Case(name: "插电 · 按上限保电 → 解释「为什么停住」",
+                 snapshot: snap(telemetryMW: -7023, voltageMV: 12400, amperageMA: -566,
+                                inputMW: 0, holdingAtLimit: true, percentage: 80),
+                 limit: 80, expect: "已接电源，但在 80% 停住了"),
+
+            Case(name: "接电未充电 · 真的欠功率 → 出「适配器功率不够用」",
+                 snapshot: snap(telemetryMW: -3862, voltageMV: 12500, amperageMA: -308,
+                                inputMW: 18312, percentage: 62),
+                 limit: nil, expect: "适配器功率不够用"),
+
+            Case(name: "接电未充电 · 遥测与物理口径打架 → 出「不一致」卡",
+                 snapshot: snap(telemetryMW: -26498, voltageMV: 12710, amperageMA: 2683,
+                                inputMW: 46379, percentage: 62),
+                 limit: nil, expect: "功率遥测与电池读数不一致"),
+        ]
+
+        for c in cases {
+            let got = alert(for: c.snapshot, heldByPolicyAt: c.limit)?.title
+            let ok = got == c.expect
+            allPassed = allPassed && ok
+            lines.append("\(ok ? "✅" : "❌") \(c.name)")
+            lines.append("     得到 \(got.map { "「\($0)」" } ?? "不出卡")"
+                         + "｜期望 \(c.expect.map { "「\($0)」" } ?? "不出卡")")
+        }
+        lines.append(allPassed ? "✅ 洞察卡四条选卡分支全部符合预期" : "❌ 有分支不符合预期")
+        return lines
     }
 }
 
