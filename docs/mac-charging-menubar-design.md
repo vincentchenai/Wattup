@@ -1006,6 +1006,13 @@ isExternalConnected && batteryNetWatts < -0.1   // ← 就是它
 
 - 保电切到电池的那几秒里 `SystemPowerIn` 的真实读数（本次没抓到插电+保电的现场）。
   第 5 条判据依赖它；现场确认后会回来收紧或放宽。第 4 条已由系统日志实证，不依赖这个。
+- 另外，本轮改动（把插电提示改成「等到 `IsCharging` 才弹」）所依赖的那个延迟，**只量过"有延迟"，
+  没量过它有多大** —— 三次探针窗口分别落在持续充电（45%→60%）与持续放电区间，恰好都没跨过插电时刻。
+  4 秒上限是拍的，不是量的。
+
+两条都可以用 `docs/probe/plug_transition.py` 采到：跑起来之后插拔一次电源，它会在每次跳变打 ★ 行，
+结束时汇总「插电 → IsCharging 置位」的 min/最大/中位数，以及保电窗口内 `SystemPowerIn` 的范围。
+**采出来的最大值若逼近 4 秒，就要把 `plugToastChargeWaitSeconds` 调大**，否则提示会退回成「未在充电」。
 
 ---
 
@@ -1019,8 +1026,10 @@ ioreg -w0 -n AppleSmartBattery | grep -oE '"(SystemPowerIn|SystemLoad|BatteryPow
 #     用 `= ?[0-9-]+` 去抓它们会静默匹配失败、拿到空值 —— 实测踩过：
 #     探针把插着电的机器一直读成"未插电"，因为机器恰好没电时 0 看起来"对"。
 ioreg -w0 -n AppleSmartBattery | grep -oE '"(ExternalConnected|IsCharging|FullyCharged)" ?= ?(Yes|No)'
-# 另外 Amperage 在 ioreg 里按**无符号 64 位**打印（放电时是 1.8e19 那种大数），
-# 要自己减 2^64 才是负数；App 侧走 CFNumber 所以本来就是对的，只有 shell/Python 探针要注意。
+# 另外**凡是有符号量都按无符号 64 位打印**：Amperage（放电）、BatteryPower（电池放电时
+# 是 18446744073709543776，实际是 -7840 mW）、SystemLoad 同理，都要自己减 2^64。
+# 这个坑更隐蔽 —— 不做转换不会报错，只会看到一个"很大的正功率"，很容易被当成有效读数。
+# App 侧走 CFNumber 所以本来就是对的，只有 shell/Python 探针要注意。
 
 # 2. 适配器信息（额定功率是标称值，不是实际输出）
 pmset -g ac

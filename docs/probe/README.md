@@ -20,6 +20,19 @@ swiftc -O -o series      series.swift      && ./series
 swiftc -O -o watch       watch.swift       && ./watch   # 观测需 150 秒
 ```
 
+**抓插电跳变时序**（不需要编译，跑起来之后去插拔电源）：
+
+```bash
+./plug_transition.py            # 1 秒一拍，跑 180 秒
+./plug_transition.py 0.2 300    # 0.2 秒一拍，跑 5 分钟
+./plug_transition.py 0.5 0      # 0.5 秒一拍，一直跑到 Ctrl-C
+```
+
+它回答的是设计文档 §15「没验证的事」里那两条：`ExternalConnected` 与 `IsCharging` 的置位差多久
+（插电提示"等到 `IsCharging` 才弹"的 4 秒上限就建立在这个延迟上）、
+以及系统按充电上限保电切到电池放电时 `SystemPowerIn` 的真实读数（判据第 5 条依赖它）。
+每次跳变打 ★ 行，结束时打一份延迟汇总 + 保电窗口的供电范围。
+
 **本机应用的能耗 A/B**（改了轮询 / 采样逻辑后必跑）：
 
 ```bash
@@ -47,3 +60,4 @@ swiftc -O -o watch       watch.swift       && ./watch   # 观测需 150 秒
 | `perf_probe.swift` | 采样耗时（0.29 / 0.061 / 1.09 ms）；`AppleSMC` 可非特权打开 |
 | `series.swift` | 逐秒采样；抓到"适配器 18.3 W、系统负载 22.2 W、电池倒灌 3.9 W"场景 |
 | `watch.swift` | 150 秒观测，确认刷新周期精确为 60 秒 |
+| `plug_transition.py` | 插电 → `IsCharging` 置位的延迟；保电放电窗口内的供电读数（§15「没验证的事」） |
