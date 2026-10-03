@@ -174,6 +174,7 @@ final class PowerModel: ObservableObject {
     private let energySampler = ProcessEnergySampler()
     private let monitor = PowerSourceMonitor()
     private var loopTask: Task<Void, Never>?
+    private var powerSourceChangeTask: Task<Void, Never>?
     private var started = false
 
     private init() {}
@@ -216,10 +217,11 @@ final class PowerModel: ObservableObject {
     /// 覆盖三个容易写错的边界：首次采样不该发事件、状态没变不该重复发、每次翻转各发一次。
     /// 边界说清楚：「真实拔掉电源时系统会不会把 `isExternalConnected` 翻过来」属于系统行为，
     /// 不在本自检范围内 —— 那一条要靠 `--watch-power-events` 真机拔插验证。
-    func selfCheckPowerEvents() -> [String] {
+    func selfCheckPowerEvents() async -> [String] {
         var lines: [String] = []
 
         let savedHandler = onToast
+        let savedUpdate = onUpdate
         let savedSnapshot = snapshot
         let savedCount = refreshCount
         var received: [String] = []
@@ -248,11 +250,66 @@ final class PowerModel: ObservableObject {
         publish(sample(true))           // ⑤ 插电
 
         lines.append("事件序列: \(received.isEmpty ? "（无）" : received.joined(separator: " → "))")
-        lines.append(received == ["拔电", "插电"]
+        let expectedEvents = AppSettings.shared.toastEnabled ? ["拔电", "插电"] : []
+        lines.append(received == expectedEvents
                      ? "✅ 判定正确：首次不发、重复不发、翻转各发一次"
-                     : "❌ 判定错误：期望「拔电 → 插电」")
+                     : "❌ 插拔事件与通知开关不一致")
+
+        // 通知没有接收者、电量计时间戳不变：第二次系统采样才报正在充电。
+        onToast = nil
+        let gaugeTime = Date()
+        var reads = 0
+        var updatedCharging = false
+        onUpdate = { updatedCharging = updatedCharging || self.snapshot.isCharging }
+        await refreshPowerSourceTransition {
+            reads += 1
+            var s = sample(true)
+            s.gaugeUpdateTime = gaugeTime
+            s.isCharging = Self.mergedIsCharging(registry: false, iops: reads >= 2,
+                                                externalConnected: true)
+            self.publish(s)
+        }
+        let promptlyCharging = reads == 2 && updatedCharging && snapshot.isCharging
+            && snapshot.gaugeUpdateTime == gaugeTime
+        lines.append(promptlyCharging
+                     ? "✅ 通知关闭时仍主动复查，电量计未更新也立即发布正在充电"
+                     : "❌ 插电后未主动复查充电状态（采样 \(reads) 次）")
+
+        var full = sample(true)
+        full.isFullyCharged = true
+        for (name, state) in [("拔电", sample(false)), ("充满", full)] {
+            reads = 0
+            await refreshPowerSourceTransition {
+                reads += 1
+                self.publish(state)
+            }
+            lines.append(reads == 1 && !snapshot.isCharging
+                         ? "✅ \(name)立即停止复查，不误报充电"
+                         : "❌ \(name)复查异常")
+        }
+
+        reads = 0
+        let cancelled = Task {
+            await self.refreshPowerSourceTransition {
+                reads += 1
+                self.publish(sample(true))
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        }
+        await cancelled.value
+        lines.append(reads == 1 ? "✅ 取消后不再复查" : "❌ 取消后仍在复查")
+
+        reads = 0
+        await refreshPowerSourceTransition {
+            reads += 1
+            self.publish(sample(true))
+        }
+        lines.append(reads == 11 && !snapshot.isCharging
+                     ? "✅ 未充电时复查有上限，不把插电当作充电"
+                     : "❌ 复查上限或充电判断异常")
 
         onToast = savedHandler
+        onUpdate = savedUpdate
         snapshot = savedSnapshot
         refreshCount = savedCount
         lastConnectedState = nil        // 复位，别把合成状态留给真实采样
@@ -452,11 +509,19 @@ final class PowerModel: ObservableObject {
             if !ok { allPassed = false }
         }
 
-        // ── 充电状态仲裁（IOPS 优先，单向覆盖） ──
+        // 实时电流优先；不可读时回退 IORegistry 与 IOPS。
         lines.append("")
         lines.append("── 充电状态仲裁 ──")
-        func chargeCase(_ name: String, registry: Bool, iops: Bool?, ext: Bool, expect: Bool) {
-            let got = Self.mergedIsCharging(registry: registry, iops: iops, externalConnected: ext)
+        let decoded = [([UInt8](arrayLiteral: 0xc1, 0x07), 1985),
+                       ([UInt8](arrayLiteral: 0xd6, 0xfd), -554),
+                       ([UInt8](arrayLiteral: 0, 0), 0)]
+        let decodingOK = decoded.allSatisfy { SMCBatterySampler.decodeCurrent($0.0) == $0.1 }
+            && SMCBatterySampler.decodeCurrent([]) == nil
+        lines.append(decodingOK ? "✅ SMC 小端有符号电流解码" : "❌ SMC 电流解码错误")
+        func chargeCase(_ name: String, registry: Bool, iops: Bool?, ext: Bool,
+                        current: Int? = nil, full: Bool = false, expect: Bool) {
+            let got = Self.mergedIsCharging(registry: registry, iops: iops, externalConnected: ext,
+                                           liveCurrentMA: current, fullyCharged: full)
             let ok = got == expect
             if !ok { allPassed = false }
             lines.append("\(ok ? "✅" : "❌") \(name)：得 \(got)")
@@ -471,8 +536,16 @@ final class PowerModel: ObservableObject {
                    registry: false, iops: true, ext: false, expect: false)
         chargeCase("IOPS 缺失 · 回用电量计",
                    registry: true, iops: nil, ext: true, expect: true)
-        lines.append("（IOPS 相对电量计的翻身速度目前只有用户侧体感证据 —— 系统菜单秒级、本应用滞后 60 秒；")
-        lines.append("  精确数字等 `docs/probe/plug_transition.py` 抓到插电现场后回填。）")
+        chargeCase("两套缓存都未充电 · 实时电流为正 → 立即显示充电",
+                   registry: false, iops: false, ext: true, current: 1985, expect: true)
+        chargeCase("缓存还报充电 · 实时电流为负 → 不误报",
+                   registry: true, iops: true, ext: true, current: -554, expect: false)
+        chargeCase("实时电流为零 · 不把插电当作充电",
+                   registry: true, iops: true, ext: true, current: 0, expect: false)
+        chargeCase("拔电 · 缓存仍报充电 → 立即去掉闪电",
+                   registry: true, iops: true, ext: false, current: 1985, expect: false)
+        chargeCase("已充满 · 不显示正在充电的闪电",
+                   registry: true, iops: true, ext: true, current: 100, full: true, expect: false)
 
         lines.append("")
         lines.append("ℹ️ 未验证：保电窗口里 `SystemPowerIn` 的真实读数（本次没抓到插电+保电的现场）；")
@@ -544,6 +617,8 @@ final class PowerModel: ObservableObject {
     func stop() {
         loopTask?.cancel()
         loopTask = nil
+        powerSourceChangeTask?.cancel()
+        powerSourceChangeTask = nil
         monitor.stop()
         started = false
     }
@@ -575,47 +650,48 @@ final class PowerModel: ObservableObject {
     }
 
     private func handlePowerSourceChange() {
-        Task { [weak self] in
+        powerSourceChangeTask?.cancel()
+        powerSourceChangeTask = Task { [weak self] in
             guard let self else { return }
-            await self.energySampler.resetBaseline()
-            self.energy = EnergyScanResult()
             // 插拔会改变策略的生效状态（按住的判据里有"接着电源"这一条），
             // 也可能让系统在释放/重新按住之间切换 —— 这一档不等节流，立刻重读
             self.refreshChargingPolicy(force: true)
-            await self.refreshSnapshot(forceEnergyScan: true)
+            await self.refreshPowerSourceTransition {
+                // 短时复查不搭载全进程能耗扫描，先发布充电状态。
+                await self.refreshSnapshot(forceEnergyScan: false, scanEnergy: false)
+            }
+            guard !Task.isCancelled else { return }
+            await self.energySampler.resetBaseline()
+            guard !Task.isCancelled else { return }
+            self.energy = EnergyScanResult()
+            await self.refreshEnergy()
         }
     }
 
-    /// 立即重采一次，不等主循环那一拍。
-    ///
-    /// 给「插电提示等 `IsCharging` 翻身」用：弹窗关闭时主循环是 5 秒一拍。
-    /// 快照合并已改成 IOPS 优先（见 `mergedIsCharging`），插电后这里通常一拍
-    /// 就能拿到「正在充电」。只在插电后的几秒内被调用几次，
-    /// **不改变常驻节律**（常驻仍是 5 秒 / 弹窗打开 1 秒）。
-    func refreshNow() async {
-        await refreshSnapshot(forceEnergyScan: false)
+    /// 先立即检测；系统充电状态尚未就绪时，每 400 ms 复查，最多持续 4 秒。
+    /// 不依赖通知开关，也不等待电量计时间戳更新；拔电或充满时结束。
+    private func refreshPowerSourceTransition(refresh: () async -> Void) async {
+        for attempt in 0...10 {
+            guard !Task.isCancelled else { return }
+            await refresh()
+            guard !Task.isCancelled,
+                  snapshot.isExternalConnected,
+                  !snapshot.isCharging, !snapshot.isFullyCharged else { return }
+            if attempt < 10 {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+            }
+        }
     }
 
     // MARK: - 充电状态仲裁
 
-    /// 插电后「正在充电」显示慢了一分钟 —— 根因与修法（2026-10-03，用户报告）。
-    ///
-    /// **根因**：`isCharging` 原先只取自 IORegistry 的 `IsCharging`，而电量计的这套字段
-    /// **60 秒才刷一拍**（见本文件头部的刷新策略）。插上电源后它滞后到一整分钟才翻身，
-    /// 期间界面一直显示「已接电源 · 未充电」、菜单栏不出闪电，插电提示也会在
-    /// 4 秒等待超时后退回「未在充电」。讽刺的是采样循环里**早就读了 IOPS**
-    /// （`PowerSourceSampler.batteryInfo()`，powerd 维护、与系统电池菜单同源，
-    /// 插拔后秒级更新 —— 系统菜单栏的电池图标就是它），却只拿它补健康度和剩余时长。
-    ///
-    /// **修法**：单向覆盖 —— IOPS 说在充，就采信（插电后的第一拍就能翻绿）。
-    /// **不做反向覆盖**：IOPS 说没充时保留 IORegistry 的值，因为涓流补电
-    /// （`isFinishingCharge`）等场景下电量计的 `true` 更细，不能被 IOPS 的
-    /// `false` 冲掉；而且按上限保电的放电窗口里 powerd 会把电源状态报成电池
-    /// （`pmset -g log` 里 `Using AC`/`Using Batt` 交替），此时 `isCharging`
-    /// 本来就该是 false，两边一致，不需要动。
-    static func mergedIsCharging(registry: Bool, iops: Bool?, externalConnected: Bool) -> Bool {
-        guard let iops, iops, !registry, externalConnected else { return registry }
-        return true
+    /// 实测插电后 IORegistry 与 IOPS 的充电标志一起滞后约 47 秒。
+    /// 优先以 SMC 实时电流判断；读取失败才回退两套缓存，拔电和充满不画闪电。
+    static func mergedIsCharging(registry: Bool, iops: Bool?, externalConnected: Bool,
+                                 liveCurrentMA: Int? = nil, fullyCharged: Bool = false) -> Bool {
+        guard externalConnected, !fullyCharged else { return false }
+        if let liveCurrentMA { return liveCurrentMA > 0 }
+        return registry || iops == true
     }
 
     // MARK: - 采样
@@ -635,7 +711,7 @@ final class PowerModel: ObservableObject {
         if secondsSinceGaugeUpdate != secondsSinceGauge { secondsSinceGaugeUpdate = secondsSinceGauge }
     }
 
-    private func refreshSnapshot(forceEnergyScan: Bool) async {
+    private func refreshSnapshot(forceEnergyScan: Bool, scanEnergy: Bool = true) async {
         let start = Date()
 
         let registrySnapshot = await Task.detached(priority: .utility) {
@@ -649,6 +725,9 @@ final class PowerModel: ObservableObject {
         let adapterInfo = await Task.detached(priority: .utility) {
             PowerSourceSampler.adapterInfo()
         }.value
+
+        // 插拔方向已变化或应用已停止时，丢弃被取消任务的旧读数。
+        guard !Task.isCancelled else { return }
 
         guard var new = registrySnapshot else {
             // 无电池机型或读取失败
@@ -665,15 +744,14 @@ final class PowerModel: ObservableObject {
             return
         }
 
+        // 先仲裁充电状态，再补剩余时间；IOPS 缺失时仍可使用实时电流。
+        new.isCharging = Self.mergedIsCharging(
+            registry: new.isCharging, iops: powerInfo?.isCharging,
+            externalConnected: new.isExternalConnected,
+            liveCurrentMA: new.liveBatteryCurrentMA, fullyCharged: new.isFullyCharged)
+
         // 用公开 API 补齐私有字段里没有的信息
         if let info = powerInfo {
-            // 充电状态仲裁 —— **必须放在 timeToFull 合并之前**，否则插电后的第一分钟
-            // 「距充满」也会跟着空白（那个字段只有在 isCharging 时才填）。
-            new.isCharging = Self.mergedIsCharging(
-                registry: new.isCharging,
-                iops: info.isCharging,
-                externalConnected: new.isExternalConnected)
-
             new.batteryHealth = info.batteryHealth
             new.healthCondition = info.healthCondition
             new.isFinishingCharge = info.isFinishingCharge ?? false
@@ -694,6 +772,8 @@ final class PowerModel: ObservableObject {
         // 充电策略只在有人看的时候读 —— 它只服务于界面展示（设置面板的状态行、
         // 弹窗的洞察卡），没有任何界面可见时读它是纯浪费。节流在方法内部。
         if isAnySurfaceVisible() { refreshChargingPolicy() }
+
+        guard scanEnergy else { return }
 
         // 能耗扫描。基线还没建立时用更短的间隔 —— 首次扫描只建基线不算增量，
         // 按常规的 30 秒间隔会让用户干等半分钟才看到排行。

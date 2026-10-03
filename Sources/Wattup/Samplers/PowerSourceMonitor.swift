@@ -24,12 +24,13 @@ final class PowerSourceMonitor {
         else { return }
 
         runLoopSource = source
-        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        // 菜单追踪期间也接收电源事件，避免用户操作菜单时延迟刷新。
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
     }
 
     func stop() {
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
         runLoopSource = nil
         handler = nil
@@ -37,7 +38,7 @@ final class PowerSourceMonitor {
 
     deinit {
         if let source = runLoopSource {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
         }
     }
 }

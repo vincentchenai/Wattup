@@ -977,21 +977,30 @@ isExternalConnected && batteryNetWatts < -0.1   // ← 就是它
 它在数据上是两个来源打架（电量计说 `IsCharging = true`，功率口径却算出净放电），
 按本文件一贯的原则（来源矛盾时不下结论）什么都不该报。
 
-### 插电后整整一分钟才显示「正在充电」（2026-10-03 用户报告，同日修复）
+### 插电后整整一分钟才显示「正在充电」（2026-10-03，实机复现后修正）
 
 用户实测：插上电源后约 60 秒，界面才从「已接电源 · 未充电」变成「正在充电」。
 
-**根因**：`isCharging` 只取自 IORegistry 的 `IsCharging`，而电量计这套字段 **60 秒才刷一拍**
-（§2 的实测节律）—— 插电后它滞后到一分钟才翻身。采样循环里其实**早就读了 IOPS**
-（`PowerSourceSampler.batteryInfo()`，powerd 维护、与系统菜单栏电池图标同源、秒级更新），
-却只拿它补健康度与剩余时长，从没用于充电状态。
+第一轮改为 IOPS 优先并在插电后每 400 ms 复查，用户重新安装后仍复现。
+实机记录：20:32:29.337 插电，IORegistry `IsCharging=false`，`pmset` 也报 `not charging`；
+20:33:16.160 系统电源信息才报充电，20:33:16.387 电量计标志翻转，两套缓存均滞后约 47 秒。
+因此 IOPS 不是独立的实时充电判据，反复读取缓存无效。
 
-**修法**（`PowerModel.mergedIsCharging`，纯函数，进 `--selfcheck-power-caliber`）：
-**单向覆盖** —— IOPS 说在充就采信，插电后第一拍（≤ 400 ms）即翻绿。
-**不做反向覆盖**：IOPS 报没充时保留电量计的值（涓流补电 `isFinishingCharge` 场景下
-电量计的 `true` 更细）；且按上限保电的放电窗口里 powerd 会把电源状态报成电池
-（`pmset -g log` 的 `Using AC`/`Using Batt` 交替），此时 `isCharging` 本来就该是 false。
-外接状态**不**从 IOPS 的电源状态覆盖 —— 保电放电窗口里它报"电池"，会把"插着电"误判成"拔电"。
+`IOPSRequestBatteryUpdate(4)` 和 `(2)` 在本机均返回 `0xe00002c2`，未触发更新，未用于产品。
+新增只读 `SMCBatterySampler.currentMA()`，读取 `AppleSMC` 的 `B0AC`：本机为小端 `si16` 毫安值。
+它与电量计电流独立变化；例如拔电后 SMC 为 −307 mA，而电量计仍保留 +1481 mA。
+仅在 Apple Silicon 且键类型、长度与请求结果有效时使用，其他情况返回 `nil`。
+
+`PowerModel.mergedIsCharging` 先排除拔电与充满，再以实时电流正负判断；实时电流不可读时
+回退 IORegistry 与 IOPS。它不把连接状态、充电目标电流直接当作正在充电。
+菜单栏由充电状态变化触发发布，不等待电量计时间戳。电源事件仍立即检测并短时复查，
+不增加常驻轮询频率，也不在短时复查中扫描全进程能耗。
+通知改为 150 ms 去抖，移除原来的 1.4 秒加最多 4 秒等待，已显示的通知随充电状态更新，
+不重置自动消失计时。外接状态仍不从 IOPS 的电源状态覆盖，保留原有保电判定。
+
+新版实机验证：20:46:23.544 接电，20:46:25.135 实时电流转为 +404 mA，
+此时 IORegistry 与 IOPS 仍报未充电，直到 20:46:36.683 才更新；实时判据提前约 11.5 秒。
+用户确认「闪电及时出现，通知显示正在充电」。重建安装与两组回归自检均通过。
 
 ### 「功率来自推导口径」在充电时的错误呈现（同日修复）
 
@@ -1045,16 +1054,12 @@ isExternalConnected && batteryNetWatts < -0.1   // ← 就是它
 
 - 保电切到电池的那几秒里 `SystemPowerIn` 的真实读数（本次没抓到插电+保电的现场）。
   第 5 条判据依赖它；现场确认后会回来收紧或放宽。第 4 条已由系统日志实证，不依赖这个。
-- 另外，本轮改动（把插电提示改成「等到 `IsCharging` 才弹」）所依赖的那个延迟，**只量过"有延迟"，
-  没量过它有多大** —— 三次探针窗口分别落在持续充电（45%→60%）与持续放电区间，恰好都没跨过插电时刻。
-  4 秒上限是拍的，不是量的。**2026-10-03 用户侧补了一条体感证据**：插电后界面滞后约 60 秒
-  才显示「正在充电」（见上节）—— 电量计字段会滞后是坐实的；IOPS 的"秒级翻身"目前靠
-  系统菜单栏图标的行为佐证，精确数字仍待现场采集。
+- Intel 平台的实时电流读取尚未实现；SMC 键不可读时使用原有数据源，仍可能有缓存延迟。
 
 两条都可以用 `docs/probe/plug_transition.py` 采到：跑起来之后插拔一次电源，它会在每次跳变打 ★ 行，
 结束时汇总「插电 → IsCharging 置位」的 min/最大/中位数，以及保电窗口内 `SystemPowerIn` 的范围。
 脚本同时列出 pmset / IOPS 视角的「在充」翻转时刻，可**直接对比两个来源谁先翻身、差多少**。
-**采出来的最大值若逼近 4 秒，就要把 `plugToastChargeWaitSeconds` 调大**，否则提示会退回成「未在充电」。
+这个脚本只对比 IORegistry 与 pmset；实时 SMC 判据需另行采集，不能由这两套缓存的时序推断。
 
 ---
 
@@ -1170,7 +1175,7 @@ $APP --sections=reset
 | `netDischargeAlarmFloorWatts` / `adapterSupplyingFloorWatts` | 同上 | 判据第 3、5 条的 0.5 W 门限（防止把噪声当缺口） |
 | `BatterySnapshot.batteryPowerIsCorroborated` / `systemLoadWatts` | 同上 | §15 口径仲裁；降级时推导负载为负要返回 `nil` |
 | `PowerModel.publish(_:)` / `significantChange` | `Model/PowerModel.swift` | 策略状态必须在出模型前算好，且进比较列表 |
-| `PowerModel.refreshNow()` | 同上 | 插电提示等待 `IsCharging` 时的"主动插一拍"入口 |
+| `PowerModel.refreshPowerSourceTransition(refresh:)` | 同上 | 电源事件立即检测与短时复查，不依赖通知开关 |
 | `PowerModel.cadence` | 同上 | `--perf` 报告的节律数字唯一出处 |
 | `PowerModel.resolvedHex(_:dark:)` / `hex(of:)` | 同上 | 颜色断言必须解析到 sRGB 分量（§15 的 `Color == JB.green` 陷阱） |
 | `ChargingPolicy` / `isHoldingNow(_:)` / `effectiveSocLimit` | `Samplers/ChargingPolicy.swift` | §14 配置 vs 此刻的语义分层 |
@@ -1178,12 +1183,13 @@ $APP --sections=reset
 | `StatusItemSignature` | `App/AppDelegate.swift`（`private struct`） | §12 状态项重绘门控 |
 | `StatusItemVerdict.evaluate` | `Samplers/SessionState.swift` | §13 三分支判定（含锁屏前置排除） |
 | `AppDelegate.measureHost` | `App/AppDelegate.swift` | §11 量自然高度必须另建不带滚动的 `NSHostingController` |
-| `AppDelegate.schedulePlugToast(_:)` / `plugToastSettleSeconds` / `plugToastChargeWaitSeconds` | 同上 | §11.2 插电提示时机（1.4 s + 等到 `IsCharging`，上限 4 s） |
+| `AppDelegate.schedulePlugToast(_:)` / `plugToastSettleSeconds` | 同上 | 插电提示仅做 150 ms 去抖 |
 | `makeGlowPanel` / `ScreenEdgeGlowView` | `UI/StatusToast.swift` | §11 屏幕边缘光带必须单独一层 `NSPanel` |
 | `InsightSection.selfCheckColors()` | `UI/PopoverView.swift` | 四张洞察卡的选择断言（该类为此从 `private struct` 放宽） |
 | `MenuBarIcon.render` / `MenuBarTint.color` / `MenuBarText.trailing` | `UI/MenuBarIcon.swift` | §7 渲染统一收口（配色在 `MenuBarTint`，不在 `MenuBarIcon`） |
 | `StatusToastController.shared` | `UI/StatusToast.swift` | 提示面板单例（设置面板预览要复用同一块） |
-| `PowerModel.mergedIsCharging(registry:iops:externalConnected:)` | `Model/PowerModel.swift` | 插电后 60 秒才显示「正在充电」的修法：IOPS 单向覆盖（见 §15 末两节） |
+| `PowerModel.mergedIsCharging` | `Model/PowerModel.swift` | 实时电流优先的充电仲裁，不把接电当充电 |
+| `SMCBatterySampler.currentMA()` / `decodeCurrent(_:)` | `Samplers/SMCBatterySampler.swift` | 只读 B0AC 与有符号小端解码，读取失败回退 |
+| `StatusToastController.updatePowerState(_:)` | `UI/StatusToast.swift` | 原位更新已显示的充电提示，不延长消失时间 |
 | `BatterySnapshot.telemetryMismatchExplained` | `Model/BatterySnapshot.swift` | 「推导口径」错误呈现的修法：正向状态背书下的口径打架按已解释处理 |
 | `SettingsWindowController.shared.show()` | `UI/SettingsWindow.swift` | 弹窗底部「设置…」的无参入口 |
-

@@ -36,6 +36,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         model.onUpdate = { [weak self] in
             self?.refreshStatusItem()
+            guard let self else { return }
+            self.toast.updatePowerState(self.model.snapshot)
         }
         // 告诉模型「现在有没有界面在展示数据」—— 它据此决定要不要写只服务于展示的指标。
         // 这里集中判断所有会展示数据的窗口，模型侧不感知任何一个窗口类。
@@ -108,6 +110,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             watchPowerEvents = true
         }
 
+        // 自检使用合成快照，不启动真实采样，避免异步复查时被后台轮询覆盖。
+        if CommandLine.arguments.contains("--selfcheck-power-event") {
+            Task { @MainActor in
+                self.log("=== 插拔事件判定自检 ===")
+                let checks = await self.model.selfCheckPowerEvents()
+                for line in checks { self.log(line) }
+                if checks.contains(where: { $0.hasPrefix("❌") }) { exit(1) }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+
         model.start()
 
         setUpStatusItem()
@@ -131,14 +145,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 NSApp.terminate(nil)
             }
-            return
-        }
-
-        // --selfcheck-power-event：用合成快照验证插拔判定（不发真提示）
-        if CommandLine.arguments.contains("--selfcheck-power-event") {
-            log("=== 插拔事件判定自检 ===")
-            for line in model.selfCheckPowerEvents() { log(line) }
-            NSApp.terminate(nil)
             return
         }
 
@@ -281,10 +287,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // --selfcheck-power-caliber：功率口径仲裁 + 「插电净放电」告警门槛 + 界面取色
         if CommandLine.arguments.contains("--selfcheck-power-caliber") {
             log("=== 功率口径仲裁自检 ===")
-            for line in model.selfCheckPowerCaliber() { log(line) }
+            var checks = model.selfCheckPowerCaliber()
             // 洞察卡是第三个会被染成橙色的界面 —— 它的取色留在 PopoverView 里，
             // 所以从这一层拼上去：模型不该反过来依赖视图。
-            for line in InsightSection.selfCheckColors() { log(line) }
+            checks += InsightSection.selfCheckColors()
+            checks += toast.selfCheckPowerUpdates()
+            for line in checks { log(line) }
+            if checks.contains(where: { $0.hasPrefix("❌") }) { exit(1) }
             NSApp.terminate(nil)
             return
         }
@@ -556,13 +565,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 提示胶囊
 
-    /// 插拔提示的固定延迟：等功率读数稳定下来
-    private static let plugToastSettleSeconds: TimeInterval = 1.4
-    /// 插电后再等 `IsCharging` 翻身的**上限** —— 翻了立刻弹，不傻等满
-    private static let plugToastChargeWaitSeconds: TimeInterval = 4.0
+    /// 只给瞬时插拔去抖，不等待缓存中的功率或充电标志。
+    private static let plugToastSettleSeconds: TimeInterval = 0.15
 
-    /// 提示到达。**插拔要晚一拍**：插上电源的瞬间功率读数还没稳定，
-    /// 抢那一两秒只会弹出一个 0.0 W 的提示；告警类没有这个问题，立即弹。
+    /// 插拔提示短暂去抖，充电状态变化后更新已经显示的提示。
     private func handleToast(_ spec: ToastSpec) {
         switch spec.kind {
         case .pluggedIn, .unplugged:
@@ -573,45 +579,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 插拔提示要等状态落定再弹。
-    ///
-    /// 插电这一路要等两件事：
-    /// 1. 插上电源的瞬间功率读数还没稳定，抢那一两秒只会弹出一个 `0.0 W`；
-    /// 2. `IsCharging` 的翻身。实测（2026-10-03 用户报告）IORegistry 电量计的字段
-    ///    **60 秒才刷一拍**，插电后它能滞后一整分钟 —— 等它要等很久。
-    ///    快照合并已改成 IOPS 优先（`PowerModel.mergedIsCharging`，powerd 秒级更新），
-    ///    所以这里的等待通常一拍（400 ms）就结束；上限 4 秒留作 IOPS 也缺席时的兜底。
-    ///
-    /// 拔电没有可等的事实，仍按固定延迟。
+    /// 插拔提示只做 150 ms 去抖，随后随真实充电状态更新。
     private func schedulePlugToast(_ kind: ToastKind) {
         pendingToast?.cancel()
         pendingToast = Task { @MainActor [weak self] in
-            // 第一拍：等功率读数稳定
             try? await Task.sleep(nanoseconds: UInt64(Self.plugToastSettleSeconds * 1_000_000_000))
             if Task.isCancelled { return }
             guard let self else { return }
-
-            // 第二拍：插电等 `IsCharging`；拔电直接过
-            if kind == .pluggedIn {
-                let deadline = Date().addingTimeInterval(Self.plugToastChargeWaitSeconds)
-                while Date() < deadline {
-                    let snap = self.model.snapshot
-                    if snap.isCharging || snap.isFullyCharged { break }
-                    // 主循环这一拍太慢，主动插一拍
-                    await self.model.refreshNow()
-                    if Task.isCancelled { return }
-                    let after = self.model.snapshot
-                    if after.isCharging || after.isFullyCharged { break }
-                    try? await Task.sleep(nanoseconds: 400_000_000)
-                    if Task.isCancelled { return }
-                }
-            }
 
             // 落定前再确认方向：中途翻回去（瞬时插拔 / 接触不良）就不弹
             let now: ToastKind = self.model.snapshot.isExternalConnected ? .pluggedIn : .unplugged
             guard now == kind else { return }
             self.toast.show(ToastSpec(kind: kind, snapshot: self.model.snapshot),
-                            seconds: self.settings.toastSeconds)
+                            seconds: self.settings.toastSeconds, followsPowerState: true)
         }
     }
 

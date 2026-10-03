@@ -64,6 +64,8 @@ struct BatterySnapshot: Sendable {
     var packVoltageMV: Int?
     /// 正 = 充电，负 = 放电
     var packAmperageMA: Int?
+    /// SMC 实时电流，只用于充电状态；不冒充电量计的功率采样。
+    var liveBatteryCurrentMA: Int?
     var batteryPowerMW: Int?
     var cellVoltagesMV: [Int] = []
     /// 摄氏度

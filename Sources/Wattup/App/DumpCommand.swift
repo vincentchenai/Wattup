@@ -102,6 +102,7 @@ enum DumpCommand {
         divider()
         p("电池电压(mV)", s.packVoltageMV)
         p("电池电流(mA)", s.packAmperageMA)
+        p("SMC实时电流(mA)", s.liveBatteryCurrentMA)
         p("电池净功率(mW,遥测)", s.batteryPowerMW)
         p("电芯电压(mV)", s.cellVoltagesMV)
         p("电池温度(°C)", s.batteryTemperatureC)

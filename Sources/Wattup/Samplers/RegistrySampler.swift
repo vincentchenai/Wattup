@@ -45,6 +45,7 @@ enum RegistrySampler {
         // 电池端
         s.packVoltageMV = int(raw["Voltage"])
         s.packAmperageMA = int(raw["Amperage"]) ?? int(raw["InstantAmperage"])
+        s.liveBatteryCurrentMA = SMCBatterySampler.currentMA()
         if let t = int(raw["Temperature"]), t > 0 { s.batteryTemperatureC = Double(t) / 100 }
 
         // 遥测口径

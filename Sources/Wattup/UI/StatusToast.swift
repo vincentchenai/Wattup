@@ -365,6 +365,7 @@ final class StatusToastController {
     /// 屏幕顶边那条光带的独立面板（`ignoresMouseEvents`，见 makeGlowPanel）
     private var glowPanel: NSPanel?
     private var dismissTask: Task<Void, Never>?
+    private var followsPowerState = false
 
     private init() {}
 
@@ -375,8 +376,10 @@ final class StatusToastController {
     func show(_ spec: ToastSpec,
               seconds: Double? = 5,
               size: AppSettings.ToastSize? = nil,
-              glow: AppSettings.EdgeGlow? = nil) {
+              glow: AppSettings.EdgeGlow? = nil,
+              followsPowerState: Bool = false) {
         dismissTask?.cancel()
+        self.followsPowerState = followsPowerState
 
         let toastSize = size ?? AppSettings.shared.toastSize
         let glowLevel = glow ?? AppSettings.shared.edgeGlow
@@ -417,6 +420,45 @@ final class StatusToastController {
         }
     }
 
+    /// 更新正在展示的插电提示，不重新播放入场动画，也不延长自动消失时间。
+    func updatePowerState(_ snapshot: BatterySnapshot) {
+        guard followsPowerState, snapshot.isExternalConnected, let panel, panel.isVisible, panel.alphaValue > 0,
+              let host = panel.contentView as? NSHostingView<StatusToastView>,
+              host.rootView.spec.kind == .pluggedIn else { return }
+        let old = host.rootView
+        guard old.spec.snapshot.isCharging != snapshot.isCharging
+            || old.spec.snapshot.isFullyCharged != snapshot.isFullyCharged else { return }
+        let spec = ToastSpec(kind: .pluggedIn, snapshot: snapshot)
+        host.rootView = StatusToastView(spec: spec, size: old.size, glow: old.glow, onTap: old.onTap)
+        host.layoutSubtreeIfNeeded()
+        let fitted = host.fittingSize
+        let size = NSSize(width: max(fitted.width, 280), height: max(fitted.height, 80))
+        host.frame = NSRect(origin: .zero, size: size)
+        panel.setContentSize(size)
+        positionAtTopCenter(panel, size: size)
+        showEdgeGlow(tint: StatusToastView.tint(for: spec), glow: old.glow)
+    }
+
+    /// 自检真实面板的内容更新，防止提示一直保留插电那一拍的“未充电”。
+    func selfCheckPowerUpdates() -> [String] {
+        var s = BatterySnapshot()
+        s.hasBattery = true
+        s.isExternalConnected = true
+        s.percentage = 73
+        show(ToastSpec(kind: .pluggedIn, snapshot: s), seconds: nil, glow: .off, followsPowerState: true)
+        panel?.alphaValue = 1
+        s.isCharging = true
+        updatePowerState(s)
+        let host = panel?.contentView as? NSHostingView<StatusToastView>
+        let charging = host?.rootView.spec.snapshot.isCharging == true
+        s.isCharging = false
+        s.isFullyCharged = true
+        updatePowerState(s)
+        let full = host?.rootView.spec.snapshot.isFullyCharged == true
+        dismiss()
+        return [charging && full ? "✅ 已显示的通知随充电、充满状态更新" : "❌ 通知仍保留旧充电状态"]
+    }
+
     /// 屏幕正上方居中。用 `visibleFrame.maxY`（已排除菜单栏）而不是 `frame.maxY`，
     /// 免得胶囊盖住菜单栏图标。
     private func positionAtTopCenter(_ panel: NSPanel, size: NSSize) {
@@ -427,6 +469,7 @@ final class StatusToastController {
     }
 
     func dismiss() {
+        followsPowerState = false
         dismissTask?.cancel()
         dismissTask = nil
         let panels = [panel, glowPanel].compactMap { $0 }
