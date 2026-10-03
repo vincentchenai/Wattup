@@ -1112,3 +1112,34 @@ $APP --sections=reset
 | `series.swift` | 逐秒采样与恒等式校验 |
 | `pid_energy.c` | 单个常驻进程的能耗 / CPU / **空闲唤醒次数**（合成使用：`./pid_energy <pid\|名字> <秒数>`） |
 | `ab_energy.sh` | 两个构建的受控 A/B（同条件、多轮、取最小值与中位数）—— 见 §12 |
+| `plug_transition.py` | 插电 → `IsCharging` 置位的延迟；保电放电窗口内的供电读数 —— 见 §15「没验证的事」（免编译，跑起来后去插拔电源） |
+
+---
+
+## 附录：关键符号名索引
+
+这份文档按"现象 → 证据 → 结论"组织，符号名散在各节里，改代码时不好找。集中列一份：
+**哪条结论落在哪个标识符上**。改这些地方之前先回上面读对应小节，别只看代码。
+
+| 标识符 | 位置 | 对应结论 |
+|---|---|---|
+| `BatterySnapshot.isNetDischargingWhilePlugged` | `Model/BatterySnapshot.swift` | §15 的五条判据本体，"橙色面"的唯一来源 |
+| `BatterySnapshot.isHoldingAtChargeLimit` | 同上 | 由 `publish` 注入的"此刻被策略按住"，参与 `significantChange` |
+| `netDischargeAlarmFloorWatts` / `adapterSupplyingFloorWatts` | 同上 | 判据第 3、5 条的 0.5 W 门限（防止把噪声当缺口） |
+| `BatterySnapshot.batteryPowerIsCorroborated` / `systemLoadWatts` | 同上 | §15 口径仲裁；降级时推导负载为负要返回 `nil` |
+| `PowerModel.publish(_:)` / `significantChange` | `Model/PowerModel.swift` | 策略状态必须在出模型前算好，且进比较列表 |
+| `PowerModel.refreshNow()` | 同上 | 插电提示等待 `IsCharging` 时的"主动插一拍"入口 |
+| `PowerModel.cadence` | 同上 | `--perf` 报告的节律数字唯一出处 |
+| `PowerModel.resolvedHex(_:dark:)` / `hex(of:)` | 同上 | 颜色断言必须解析到 sRGB 分量（§15 的 `Color == JB.green` 陷阱） |
+| `ChargingPolicy` / `isHoldingNow(_:)` / `effectiveSocLimit` | `Samplers/ChargingPolicy.swift` | §14 配置 vs 此刻的语义分层 |
+| `WattupChargingReasonShim` | 同上 | `NSKeyedUnarchiver` 只解 UID 的绕法（嵌套类必须显式 `@objc` 名） |
+| `StatusItemSignature` | `App/AppDelegate.swift`（`private struct`） | §12 状态项重绘门控 |
+| `StatusItemVerdict.evaluate` | `Samplers/SessionState.swift` | §13 三分支判定（含锁屏前置排除） |
+| `AppDelegate.measureHost` | `App/AppDelegate.swift` | §11 量自然高度必须另建不带滚动的 `NSHostingController` |
+| `AppDelegate.schedulePlugToast(_:)` / `plugToastSettleSeconds` / `plugToastChargeWaitSeconds` | 同上 | §11.2 插电提示时机（1.4 s + 等到 `IsCharging`，上限 4 s） |
+| `makeGlowPanel` / `ScreenEdgeGlowView` | `UI/StatusToast.swift` | §11 屏幕边缘光带必须单独一层 `NSPanel` |
+| `InsightSection.selfCheckColors()` | `UI/PopoverView.swift` | 四张洞察卡的选择断言（该类为此从 `private struct` 放宽） |
+| `MenuBarIcon.render` / `MenuBarTint.color` / `MenuBarText.trailing` | `UI/MenuBarIcon.swift` | §7 渲染统一收口（配色在 `MenuBarTint`，不在 `MenuBarIcon`） |
+| `StatusToastController.shared` | `UI/StatusToast.swift` | 提示面板单例（设置面板预览要复用同一块） |
+| `SettingsWindowController.shared.show()` | `UI/SettingsWindow.swift` | 弹窗底部「设置…」的无参入口 |
+
