@@ -182,6 +182,22 @@ struct BatterySnapshot: Sendable {
             : telemetrySource
     }
 
+    /// 遥测与物理口径打架，但**有正向状态背书** —— 矛盾是已解释的暂时现象。
+    ///
+    /// 「正在充电 / 已充满 / 被策略按住」是电量计给出的独立事实，它本身就是物理口径的旁证
+    /// （充电中而物理口径指向放电，或反过来，在数据上不可能长期成立）。
+    /// 此时遥测（`PowerTelemetryData`，60 秒一拍）多半还停在插电前那一拍 ——
+    /// 实测用户视角：插上电源后整整一分钟，遥测说放电、电压 × 电流说充电，
+    /// 界面于是挂着橙色的「功率来源降级」，洞察卡还错误地解释成"没有读到
+    /// PowerTelemetryData"（其实读到了，是它还没跟上）。
+    ///
+    /// 这种情况下采信物理口径**不算降级**：电压与电流是电池端的直接测量，
+    /// 不是从别的量推出来的近似值。UI 用它把橙色的「降级」呈现换成中性的说明。
+    var telemetryMismatchExplained: Bool {
+        batteryPowerIsCorroborated == false
+            && (isCharging || isFullyCharged || isHoldingAtChargeLimit)
+    }
+
     /// 电池端功率（W），由电压电流算出的物理口径，用于交叉校验
     var packWattsFromVI: Double? {
         guard let v = packVoltageMV, let i = packAmperageMA else { return nil }

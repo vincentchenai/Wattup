@@ -600,15 +600,19 @@ P2 的每项都是独立的风险面，建议单独评估，不要混进 P0/P1�
 **成因**是两件事叠在一起，都跟「读数比事件慢」有关：
 
 1. `ExternalConnected` 是**物理存在**，插上就立刻为真；
-   而 `IsCharging` 要等 PD 协商 + 系统决定充不充（还要看充电上限、温度），
-   实测要**几秒**才翻过来。这两件事不同时发生。
+   而 `IsCharging` 要等 PD 协商 + 系统决定充不充（还要看充电上限、温度）才翻过来。
+   **2026-10-03 用户实测把它量化了：IORegistry 的 `IsCharging` 能滞后约 60 秒**
+   —— 电量计那套字段本来就是 60 秒一拍（见 §2），插电后要等下一拍才翻身。
 2. 提示在 1.4 秒后就弹，而**主循环在弹窗关闭时是 5 秒一拍** ——
    1.4 秒那一刻手里的快照还是插电事件那一拍（`isCharging = false`）。
    于是提示报告的其实是一个「几秒前的真实状态」，正好落在用户最关心结论的那一刻。
 
-**修法**（`AppDelegate.schedulePlugToast` + `PowerModel.refreshNow`）：
+**修法**（`AppDelegate.schedulePlugToast` + `PowerModel.refreshNow` + `PowerModel.mergedIsCharging`）：
 
-- 插电这一路在 1.4 秒之后**继续等到 `IsCharging || isFullyCharged`**，上限 4 秒；翻到就立刻弹，不傻等满。
+- **快照合并改为 IOPS 优先**（详见 §15「插电后整整一分钟才显示正在充电」一节）：
+  IOPS（powerd，与系统菜单栏电池图标同源）报在充就采信，插电后第一拍即翻绿。
+- 插电这一路在 1.4 秒之后**继续等到 `IsCharging || isFullyCharged`**，上限 4 秒；
+  有 IOPS 仲裁后通常一拍（400 ms）就等到，4 秒只是 IOPS 也缺席时的兜底。
 - 等的过程里不等主循环 —— 每 400 ms 调一次 `PowerModel.refreshNow()` 主动插一拍
   （`refreshSnapshot` 的 `@MainActor` 串行保证不会和主循环打架）。
 - 全程只发生在插电后的几秒内，**不改变常驻节律**（常驻仍 5 秒 / 弹窗打开 1 秒）。
@@ -973,6 +977,41 @@ isExternalConnected && batteryNetWatts < -0.1   // ← 就是它
 它在数据上是两个来源打架（电量计说 `IsCharging = true`，功率口径却算出净放电），
 按本文件一贯的原则（来源矛盾时不下结论）什么都不该报。
 
+### 插电后整整一分钟才显示「正在充电」（2026-10-03 用户报告，同日修复）
+
+用户实测：插上电源后约 60 秒，界面才从「已接电源 · 未充电」变成「正在充电」。
+
+**根因**：`isCharging` 只取自 IORegistry 的 `IsCharging`，而电量计这套字段 **60 秒才刷一拍**
+（§2 的实测节律）—— 插电后它滞后到一分钟才翻身。采样循环里其实**早就读了 IOPS**
+（`PowerSourceSampler.batteryInfo()`，powerd 维护、与系统菜单栏电池图标同源、秒级更新），
+却只拿它补健康度与剩余时长，从没用于充电状态。
+
+**修法**（`PowerModel.mergedIsCharging`，纯函数，进 `--selfcheck-power-caliber`）：
+**单向覆盖** —— IOPS 说在充就采信，插电后第一拍（≤ 400 ms）即翻绿。
+**不做反向覆盖**：IOPS 报没充时保留电量计的值（涓流补电 `isFinishingCharge` 场景下
+电量计的 `true` 更细）；且按上限保电的放电窗口里 powerd 会把电源状态报成电池
+（`pmset -g log` 的 `Using AC`/`Using Batt` 交替），此时 `isCharging` 本来就该是 false。
+外接状态**不**从 IOPS 的电源状态覆盖 —— 保电放电窗口里它报"电池"，会把"插着电"误判成"拔电"。
+
+### 「功率来自推导口径」在充电时的错误呈现（同日修复）
+
+同一条根因链的第二面：`isCharging` 迟迟不翻身 + 遥测块停在插电前那一拍 →
+遥测（放电）与物理口径（充电）打架 → `effectiveTelemetrySource` 降为 `.derived`，
+英雄卡挂橙色「功率来源降级」，洞察卡显示「功率来自推导口径」——
+而那张卡的文案写的是"**没有读到** PowerTelemetryData"，在充电场景下是**错话**
+（读到了，只是它没跟上）。用户拿着这句来问"什么原因"。
+
+**修法**：新增 `BatterySnapshot.telemetryMismatchExplained` ——
+打架但**有正向状态背书**（充电中 / 已充满 / 被按住）时，矛盾按"已解释的暂时现象"处理：
+
+- 洞察卡：**不出卡**（正向状态不带警告；遥测块整个缺失时才出「功率来自推导口径」）。
+- 英雄卡：橙色的「功率来源降级」换成灰色小字「遥测还没跟上（60 秒一拍），功率以电池端口径为准」。
+- 数值本身不变：`batteryNetWatts` 在打架时本来就取物理口径 —— 电压 × 电流是电池端的
+  **直接测量**，充电中由电量计状态背书，采信它不算静默降级。
+- 自检：`--selfcheck-power-caliber` 的洞察卡断言从 4 条扩到 **5 条**
+  （充电 + 打架 → 不出卡；充电 + 遥测缺失 → 出「推导」卡），并新增
+  **5 条充电状态仲裁断言**。
+
 第 4 条的输入 `isHoldingAtChargeLimit` **不在 IORegistry 里** ——
 它来自 §14 那条策略（`ChargingPolicy.isHoldingNow`：接电 + 未充电 + 电量 ≥ 停充点），
 由 `PowerModel.publish` 在发布前写进快照，好让颜色/文案这些纯函数视图不必持有模型。
@@ -1008,10 +1047,13 @@ isExternalConnected && batteryNetWatts < -0.1   // ← 就是它
   第 5 条判据依赖它；现场确认后会回来收紧或放宽。第 4 条已由系统日志实证，不依赖这个。
 - 另外，本轮改动（把插电提示改成「等到 `IsCharging` 才弹」）所依赖的那个延迟，**只量过"有延迟"，
   没量过它有多大** —— 三次探针窗口分别落在持续充电（45%→60%）与持续放电区间，恰好都没跨过插电时刻。
-  4 秒上限是拍的，不是量的。
+  4 秒上限是拍的，不是量的。**2026-10-03 用户侧补了一条体感证据**：插电后界面滞后约 60 秒
+  才显示「正在充电」（见上节）—— 电量计字段会滞后是坐实的；IOPS 的"秒级翻身"目前靠
+  系统菜单栏图标的行为佐证，精确数字仍待现场采集。
 
 两条都可以用 `docs/probe/plug_transition.py` 采到：跑起来之后插拔一次电源，它会在每次跳变打 ★ 行，
 结束时汇总「插电 → IsCharging 置位」的 min/最大/中位数，以及保电窗口内 `SystemPowerIn` 的范围。
+脚本同时列出 pmset / IOPS 视角的「在充」翻转时刻，可**直接对比两个来源谁先翻身、差多少**。
 **采出来的最大值若逼近 4 秒，就要把 `plugToastChargeWaitSeconds` 调大**，否则提示会退回成「未在充电」。
 
 ---
@@ -1141,5 +1183,7 @@ $APP --sections=reset
 | `InsightSection.selfCheckColors()` | `UI/PopoverView.swift` | 四张洞察卡的选择断言（该类为此从 `private struct` 放宽） |
 | `MenuBarIcon.render` / `MenuBarTint.color` / `MenuBarText.trailing` | `UI/MenuBarIcon.swift` | §7 渲染统一收口（配色在 `MenuBarTint`，不在 `MenuBarIcon`） |
 | `StatusToastController.shared` | `UI/StatusToast.swift` | 提示面板单例（设置面板预览要复用同一块） |
+| `PowerModel.mergedIsCharging(registry:iops:externalConnected:)` | `Model/PowerModel.swift` | 插电后 60 秒才显示「正在充电」的修法：IOPS 单向覆盖（见 §15 末两节） |
+| `BatterySnapshot.telemetryMismatchExplained` | `Model/BatterySnapshot.swift` | 「推导口径」错误呈现的修法：正向状态背书下的口径打架按已解释处理 |
 | `SettingsWindowController.shared.show()` | `UI/SettingsWindow.swift` | 弹窗底部「设置…」的无参入口 |
 

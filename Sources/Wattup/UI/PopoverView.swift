@@ -173,12 +173,17 @@ private struct HeroCard: View {
 
                 if s.effectiveTelemetrySource.isDegraded {
                     HStack(spacing: 5) {
-                        Image(systemName: "exclamationmark.triangle")
+                        Image(systemName: s.telemetryMismatchExplained
+                              ? "clock.arrow.circlepath" : "exclamationmark.triangle")
                             .font(.system(size: 9))
-                        Text("功率来源降级：\(s.effectiveTelemetrySource.label)")
+                        Text(s.telemetryMismatchExplained
+                             ? "遥测还没跟上（60 秒一拍），功率以电池端口径为准"
+                             : "功率来源降级：\(s.effectiveTelemetrySource.label)")
                             .font(.system(size: 9.5))
                     }
-                    .foregroundStyle(JB.orange)
+                    // 充电中与遥测打架是已解释的暂时现象（见 telemetryMismatchExplained），
+                    // 用中性灰说明，不挂橙色 —— 挂着会让人以为机器坏了（实测用户就是这么问的）
+                    .foregroundStyle(s.telemetryMismatchExplained ? JB.faint : JB.orange)
                 }
             }
         }
@@ -237,11 +242,12 @@ struct InsightSection {
             // 两种情况都会落到「推导口径」，**原因必须说清是哪一个** ——
             // 「没读到」和「读到了但与物理口径打架」对用户意味着完全不同的事。
             //
-            // 但「打架」这一条要排除充电中：插电后遥测块（`PowerTelemetryData`，
-            // 60 秒才刷新一次）还没跟上，那一拍的"打架"是暂时现象，
-            // 拿它当故障提示会让人以为机器坏了。判据与「适配器功率不足」告警共用
-            // 同一条原则：正在充电是正向状态，来源矛盾时不下结论（见设计文档 §15）。
-            if s.batteryPowerIsCorroborated == false && !s.isCharging {
+            // 「打架」再分两支：有正向状态背书（充电中/已充满/被按住）的矛盾是
+            // 遥测块 60 秒一拍没跟上的暂时现象 → **不出卡**（正向状态不该带警告，
+            // 更不能把"没读到"这句错话安在"读到了但没跟上"头上 —— 实测用户就拿着
+            // 这句来问"什么原因"）。没有背书的矛盾才是真的口径冲突 → 出「不一致」卡。
+            if s.batteryPowerIsCorroborated == false {
+                if s.telemetryMismatchExplained { return nil }
                 let disc = s.identityDiscrepancyWatts.map { Fmt.watts($0, digits: 1) } ?? "—"
                 let telemetrySays = (s.batteryNetWattsTelemetry ?? 0) < 0 ? "放电" : "充电"
                 return Alert(
@@ -295,8 +301,13 @@ struct InsightSection {
         }
 
         let cases: [Case] = [
-            Case(name: "插电 · 正在充电（遥测停在插电前那一拍）→ 不出「不一致」卡",
+            Case(name: "插电 · 正在充电（遥测停在插电前那一拍）→ 不出卡（正向状态不带警告）",
                  snapshot: snap(charging: true, telemetryMW: -7023, voltageMV: 12580,
+                                amperageMA: 2100, inputMW: 0, percentage: 78),
+                 limit: nil, expect: nil),
+
+            Case(name: "插电 · 正在充电 · 遥测块整个缺失 → 出「功率来自推导口径」",
+                 snapshot: snap(charging: true, telemetryMW: nil, voltageMV: 12580,
                                 amperageMA: 2100, inputMW: 0, percentage: 78),
                  limit: nil, expect: "功率来自推导口径"),
 
@@ -324,7 +335,7 @@ struct InsightSection {
             lines.append("     得到 \(got.map { "「\($0)」" } ?? "不出卡")"
                          + "｜期望 \(c.expect.map { "「\($0)」" } ?? "不出卡")")
         }
-        lines.append(allPassed ? "✅ 洞察卡四条选卡分支全部符合预期" : "❌ 有分支不符合预期")
+        lines.append(allPassed ? "✅ 洞察卡五条选卡分支全部符合预期" : "❌ 有分支不符合预期")
         return lines
     }
 }

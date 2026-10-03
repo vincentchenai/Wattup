@@ -452,6 +452,28 @@ final class PowerModel: ObservableObject {
             if !ok { allPassed = false }
         }
 
+        // ── 充电状态仲裁（IOPS 优先，单向覆盖） ──
+        lines.append("")
+        lines.append("── 充电状态仲裁 ──")
+        func chargeCase(_ name: String, registry: Bool, iops: Bool?, ext: Bool, expect: Bool) {
+            let got = Self.mergedIsCharging(registry: registry, iops: iops, externalConnected: ext)
+            let ok = got == expect
+            if !ok { allPassed = false }
+            lines.append("\(ok ? "✅" : "❌") \(name)：得 \(got)")
+        }
+        chargeCase("插电 · 电量计还没翻身、IOPS 已报在充 → 采信 IOPS（本次修复的主场景）",
+                   registry: false, iops: true, ext: true, expect: true)
+        chargeCase("插电 · 两边都报在充 → 不变",
+                   registry: true, iops: true, ext: true, expect: true)
+        chargeCase("IOPS 报没充 · 保留电量计的 true（涓流补电不能被冲掉）",
+                   registry: true, iops: false, ext: true, expect: true)
+        chargeCase("未接电源 · IOPS 的在充不采信（防止电池供电下画闪电）",
+                   registry: false, iops: true, ext: false, expect: false)
+        chargeCase("IOPS 缺失 · 回用电量计",
+                   registry: true, iops: nil, ext: true, expect: true)
+        lines.append("（IOPS 相对电量计的翻身速度目前只有用户侧体感证据 —— 系统菜单秒级、本应用滞后 60 秒；")
+        lines.append("  精确数字等 `docs/probe/plug_transition.py` 抓到插电现场后回填。）")
+
         lines.append("")
         lines.append("ℹ️ 未验证：保电窗口里 `SystemPowerIn` 的真实读数（本次没抓到插电+保电的现场）；")
         lines.append("   ⑦⑨ 两条依赖「适配器没出力」这个判据，现场确认后会回来收紧或放宽。")
@@ -566,12 +588,34 @@ final class PowerModel: ObservableObject {
 
     /// 立即重采一次，不等主循环那一拍。
     ///
-    /// 给「插电提示等 `IsCharging` 翻身」用：弹窗关闭时主循环是 5 秒一拍，
-    /// 而电量计把「正在充电」翻过来只要 1–3 秒 —— 等主循环等不到，
-    /// 于是提示会一直停在「未在充电」。只在插电后的几秒内被调用几次，
+    /// 给「插电提示等 `IsCharging` 翻身」用：弹窗关闭时主循环是 5 秒一拍。
+    /// 快照合并已改成 IOPS 优先（见 `mergedIsCharging`），插电后这里通常一拍
+    /// 就能拿到「正在充电」。只在插电后的几秒内被调用几次，
     /// **不改变常驻节律**（常驻仍是 5 秒 / 弹窗打开 1 秒）。
     func refreshNow() async {
         await refreshSnapshot(forceEnergyScan: false)
+    }
+
+    // MARK: - 充电状态仲裁
+
+    /// 插电后「正在充电」显示慢了一分钟 —— 根因与修法（2026-10-03，用户报告）。
+    ///
+    /// **根因**：`isCharging` 原先只取自 IORegistry 的 `IsCharging`，而电量计的这套字段
+    /// **60 秒才刷一拍**（见本文件头部的刷新策略）。插上电源后它滞后到一整分钟才翻身，
+    /// 期间界面一直显示「已接电源 · 未充电」、菜单栏不出闪电，插电提示也会在
+    /// 4 秒等待超时后退回「未在充电」。讽刺的是采样循环里**早就读了 IOPS**
+    /// （`PowerSourceSampler.batteryInfo()`，powerd 维护、与系统电池菜单同源，
+    /// 插拔后秒级更新 —— 系统菜单栏的电池图标就是它），却只拿它补健康度和剩余时长。
+    ///
+    /// **修法**：单向覆盖 —— IOPS 说在充，就采信（插电后的第一拍就能翻绿）。
+    /// **不做反向覆盖**：IOPS 说没充时保留 IORegistry 的值，因为涓流补电
+    /// （`isFinishingCharge`）等场景下电量计的 `true` 更细，不能被 IOPS 的
+    /// `false` 冲掉；而且按上限保电的放电窗口里 powerd 会把电源状态报成电池
+    /// （`pmset -g log` 里 `Using AC`/`Using Batt` 交替），此时 `isCharging`
+    /// 本来就该是 false，两边一致，不需要动。
+    static func mergedIsCharging(registry: Bool, iops: Bool?, externalConnected: Bool) -> Bool {
+        guard let iops, iops, !registry, externalConnected else { return registry }
+        return true
     }
 
     // MARK: - 采样
@@ -623,6 +667,13 @@ final class PowerModel: ObservableObject {
 
         // 用公开 API 补齐私有字段里没有的信息
         if let info = powerInfo {
+            // 充电状态仲裁 —— **必须放在 timeToFull 合并之前**，否则插电后的第一分钟
+            // 「距充满」也会跟着空白（那个字段只有在 isCharging 时才填）。
+            new.isCharging = Self.mergedIsCharging(
+                registry: new.isCharging,
+                iops: info.isCharging,
+                externalConnected: new.isExternalConnected)
+
             new.batteryHealth = info.batteryHealth
             new.healthCondition = info.healthCondition
             new.isFinishingCharge = info.isFinishingCharge ?? false

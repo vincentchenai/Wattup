@@ -40,6 +40,9 @@ FIELD = re.compile(r'"(%s)"\s*=\s*([^,}\n]*)' % "|".join(KEYS))
 UINT64 = 1 << 64
 I64_MAX = (1 << 63) - 1
 
+PMSET_SOURCE = re.compile(r"now drawing from '([^']+)'", re.I)
+PMSET_STATUS = re.compile(r"\d+%;\s*([a-z ]+);", re.I)
+
 
 def flag(text):
     """ioreg 把布尔打印成 Yes / No。"""
@@ -61,6 +64,23 @@ def signed(text, default=0):
     """
     value = number(text, default)
     return value - UINT64 if 0 < value > I64_MAX else value
+
+
+def read_pmset():
+    """powerd / IOPS 视角（应用侧 `PowerModel.mergedIsCharging` 的仲裁来源）。
+
+    `pmset -g batt` 与 IOPS 同源：系统菜单栏电池图标显示什么，它就报什么。
+    放这一列是为了在下次插电时直接对比 —— ioreg 的 `IsCharging` 和它谁先翻身、差多少。
+    """
+    out = subprocess.run(["pmset", "-g", "batt"],
+                         capture_output=True, text=True, timeout=5).stdout
+    src = PMSET_SOURCE.search(out)
+    status = PMSET_STATUS.search(out)
+    return {
+        "ac": bool(src and "AC" in src.group(1)),
+        "charging": bool(status and status.group(1).strip().startswith("charging")
+                         and "discharging" not in status.group(1)),
+    }
 
 
 def read_snapshot():
@@ -91,9 +111,9 @@ def main():
     interval = float(sys.argv[1]) if len(sys.argv) > 1 else 1.0
     duration = float(sys.argv[2]) if len(sys.argv) > 2 else 180.0
 
-    print("时刻          Ext Chg Full Cap  A(mA)   V(mV)  SysIn    BattP    Load     相对墙钟")
-    print("            （SysIn / BattP / Load 单位 mW；BattP 为负 = 电池在放电）")
-    print("-" * 88)
+    print("时刻          Ext Chg Full Cap  A(mA)   V(mV)  SysIn    BattP    Load     PM(AC 充) 相对墙钟")
+    print("            （SysIn / BattP / Load 单位 mW；BattP 为负 = 电池在放电；PM = pmset/IOPS 视角）")
+    print("-" * 100)
 
     start = time.time()
     prev = None
@@ -110,20 +130,21 @@ def main():
                 break
 
             snap = read_snapshot()
+            snap.update(read_pmset())
             stamp = time.strftime("%H:%M:%S") + f".{int(now % 1 * 1000):03d}"
 
             print(
                 f"{stamp}  {snap['ext']}   {snap['chg']}   {snap['full']}   "
                 f"{snap['cap']:>3}  {snap['amp']:>6}  {snap['volt']:>5}  "
                 f"{snap['sysin']:>6}  {snap['batp']:>6}  {snap['load']:>6}   "
-                f"+{elapsed:7.2f}s"
+                f"  {int(snap['ac'])}   {int(snap['charging'])}    +{elapsed:7.2f}s"
             )
 
             if prev is not None:
                 if snap["ext"] != prev["ext"]:
                     mark = "插电" if snap["ext"] else "拔电"
                     print(f"  ★ {mark}：ExternalConnected {prev['ext']} → {snap['ext']}"
-                          f"  （+{elapsed:.2f}s，电量 {snap['cap']}%）")
+                          f"  （+{elapsed:.2f}s，电量 {snap['cap']}%，pmset 充电={snap['charging']}）")
                     events.append((elapsed, mark))
                     if snap["ext"]:
                         ext_on_at = elapsed
@@ -150,6 +171,12 @@ def main():
                     print(f"  ★ FullyCharged {prev['full']} → {snap['full']}"
                           f"（+{elapsed:.2f}s，电量 {snap['cap']}%）")
 
+                if snap["charging"] != prev["charging"]:
+                    mark = "pmset 报在充" if snap["charging"] else "pmset 报没充"
+                    lag = f"  ← 距插电 {elapsed - ext_on_at:.2f}s" if snap["charging"] and ext_on_at is not None else ""
+                    print(f"  ★ {mark}（+{elapsed:.2f}s）{lag}")
+                    events.append((elapsed, mark))
+
                 if snap["upd"] != prev["upd"]:
                     print(f"  · 电量计刷新（UpdateTime 变了，+{elapsed:.2f}s）")
 
@@ -170,6 +197,7 @@ def main():
 
     # 插电 → IsCharging 的延迟
     lags = []
+    pmset_lags = []
     last_ext = None
     for t, what in events:
         if what == "插电":
@@ -177,15 +205,25 @@ def main():
         elif what == "IsCharging 置位" and last_ext is not None:
             lags.append(t - last_ext)
             last_ext = None
+        elif what == "pmset 报在充" and last_ext is not None:
+            pmset_lags.append(t - last_ext)
 
-    if lags:
-        print(f"\n插电 → IsCharging 置位的延迟（{len(lags)} 次）：")
-        for i, lag in enumerate(lags, 1):
-            print(f"  第 {i} 次：{lag:.2f} s")
-        print(f"  最小值 {min(lags):.2f}s ／ 最大 {max(lags):.2f}s ／ "
-              f"中位数 {sorted(lags)[len(lags) // 2]:.2f}s")
-        print("  → 插电提示的等待上限（AppDelegate.plugToastChargeWaitSeconds = 4.0 s）"
-              "应当大于这里的最大值，否则提示会退回成「未在充电」。")
+    if lags or pmset_lags:
+        print(f"\n插电 → 各来源报「在充」的延迟：")
+        if pmset_lags:
+            print(f"  pmset / IOPS（powerd）：{len(pmset_lags)} 次，"
+                  f"最小 {min(pmset_lags):.2f}s ／ 最大 {max(pmset_lags):.2f}s ／ "
+                  f"中位数 {sorted(pmset_lags)[len(pmset_lags) // 2]:.2f}s")
+        if lags:
+            print(f"  ioreg IsCharging（电量计）：{len(lags)} 次，"
+                  f"最小 {min(lags):.2f}s ／ 最大 {max(lags):.2f}s ／ "
+                  f"中位数 {sorted(lags)[len(lags) // 2]:.2f}s")
+        if pmset_lags and lags:
+            n = min(len(pmset_lags), len(lags))
+            print(f"  两者之差（电量计滞后多少）：前 {n} 组平均 "
+                  f"{sum(sorted(lags)[i] - sorted(pmset_lags)[i] for i in range(n)) / n:.2f}s")
+        print("\n  → 应用已改为 IOPS 优先仲裁（PowerModel.mergedIsCharging）——")
+        print("    上面的 pmset 延迟就是用户能感知到的「插上后多久显示正在充电」。")
     else:
         print("\n没抓到「插电 → 正在充电」的完整过程 —— 插拔一次电源再跑一遍。")
 

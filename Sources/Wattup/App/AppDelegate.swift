@@ -577,12 +577,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     ///
     /// 插电这一路要等两件事：
     /// 1. 插上电源的瞬间功率读数还没稳定，抢那一两秒只会弹出一个 `0.0 W`；
-    /// 2. 更要紧的是 `IsCharging` —— 电量计要 1–3 秒才把「正在充电」翻过来。
-    ///    提示里最有价值的内容（正在充电 / 多久充满 / 充入功率）全都要等它，
-    ///    抢在它之前弹只会得到一句「未在充电」，而用户明明看着它在充。
+    /// 2. `IsCharging` 的翻身。实测（2026-10-03 用户报告）IORegistry 电量计的字段
+    ///    **60 秒才刷一拍**，插电后它能滞后一整分钟 —— 等它要等很久。
+    ///    快照合并已改成 IOPS 优先（`PowerModel.mergedIsCharging`，powerd 秒级更新），
+    ///    所以这里的等待通常一拍（400 ms）就结束；上限 4 秒留作 IOPS 也缺席时的兜底。
     ///
-    /// 所以插电时**等到 `IsCharging` 翻身或超时**为止，中间按需重采
-    /// （主循环关闭弹窗时 5 秒一拍，等它等不到）。拔电没有可等的事实，仍按固定延迟。
+    /// 拔电没有可等的事实，仍按固定延迟。
     private func schedulePlugToast(_ kind: ToastKind) {
         pendingToast?.cancel()
         pendingToast = Task { @MainActor [weak self] in
